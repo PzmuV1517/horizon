@@ -202,7 +202,8 @@ pub struct PostProgram {
     /// The program's name (`composite3`).
     pub name: String,
     pub group: Group,
-    pub program: Program,
+    /// The vertex and fragment stages; `None` for a program of compute stages only.
+    pub program: Option<Program>,
     /// colortex buffer of each fragment output location (location n writes `buffers[n]`).
     pub buffers: Vec<u32>,
     /// `flip.<name>.<buffer>`: buffers forced to flip (true) or kept (false) after this program.
@@ -692,7 +693,7 @@ fn load_shadow(
     ];
     let reads = (post.programs.iter())
         .chain(gbuffers.into_iter().flatten())
-        .flat_map(|p| &p.program.interface.samplers)
+        .flat_map(|p| p.program.iter().flat_map(|q| &q.interface.samplers))
         .any(|s| SHADOW_SAMPLERS.contains(&s.name.as_str()));
     let forced = match loader.properties.get("shadow.enabled").map(str::trim) {
         Some("true") => Some(true),
@@ -793,12 +794,25 @@ impl Loader<'_> {
                 &self.options,
                 &self.switches,
             );
-            if on && self.pack.exists(&path("csh")) {
-                notes.push(format!(
-                    "{name}: compute-only programs are not supported yet"
-                ));
+            // A program of compute stages only (`.csh` without `.vsh` and `.fsh`).
+            let composite = matches!(
+                group,
+                Group::Prepare | Group::Deferred | Group::Composite | Group::ShadowComp
+            );
+            if !on || !composite || !self.pack.exists(&path("csh")) {
+                return None;
             }
-            return None;
+            let compute = self.compute(&name);
+            return (!compute.is_empty()).then(|| PostProgram {
+                flips: flips(self.properties, &name),
+                name,
+                group,
+                program: None,
+                buffers: Vec::new(),
+                blend: None,
+                mipmaps: 0,
+                compute,
+            });
         }
         if !enabled(
             self.properties,
@@ -871,7 +885,7 @@ impl Loader<'_> {
             flips: flips(self.properties, &name),
             name,
             group,
-            program,
+            program: Some(program),
             buffers,
             blend: None,
             mipmaps,
