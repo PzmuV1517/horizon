@@ -71,8 +71,8 @@ wgpu-hal = { path = "third_party/wgpu-hal" }
 # naga 30.0.1 with fixes to its GLSL frontend that shader packs need: textureGather, texture() in
 # vertex shaders, structs with array members, vecN(bool) and vector % scalar. Drop this once a
 # naga release has them.
-naga = { git = "https://github.com/PzmuV1517/wgpu", rev = "42be8e6c24dc673221426b0371fb651807249451" }
-naga-types = { git = "https://github.com/PzmuV1517/wgpu", rev = "42be8e6c24dc673221426b0371fb651807249451" }
+naga = { git = "https://github.com/PzmuV1517/wgpu", rev = "871a4ca0120d77791c2c36cda092d02dabff989d" }
+naga-types = { git = "https://github.com/PzmuV1517/wgpu", rev = "871a4ca0120d77791c2c36cda092d02dabff989d" }
 
 # Line tables keep file:line in backtraces; full debug info made every
 # example and test binary hundreds of megabytes and slow to link.

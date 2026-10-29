@@ -199,6 +199,9 @@ fn real_packs_read() {
                 println!("    {note}");
             }
             let post = load_post(&pack, &folder, &shaders, &macros, &inputs);
+            if std::env::var_os("BACKENDS").is_some() {
+                backends(&post);
+            }
             for p in post.programs.iter().chain(&post.shadow_comp) {
                 if std::env::var("PRINT_PROGRAM").is_ok_and(|n| n == p.name)
                     && let Some(program) = &p.program
@@ -265,4 +268,151 @@ fn real_packs_read() {
         read += 1;
     }
     assert!(read > 0, "no packs under {}", dir.display());
+}
+
+/// Every module of `post` through the shader writers wgpu uses (SPIR-V for Vulkan, HLSL for
+/// DirectX 12, GLSL for OpenGL, MSL for Metal), printing each error and panic (`BACKENDS=1`).
+fn backends(post: &horizon_shaders::Post) {
+    let optional = [
+        &post.terrain,
+        &post.water,
+        &post.sky,
+        &post.sky_textured,
+        &post.entities,
+        &post.block,
+        &post.entities_translucent,
+        &post.particles,
+        &post.clouds,
+        &post.weather,
+        &post.hand,
+        &post.shadow,
+        &post.shadow_water,
+        &post.shadow_entities,
+        &post.shadow_block,
+    ];
+    let mut modules: Vec<(String, &naga::Module)> = Vec::new();
+    for p in post
+        .programs
+        .iter()
+        .chain(&post.shadow_comp)
+        .chain(optional.into_iter().flatten())
+    {
+        if let Some(program) = &p.program {
+            modules.push((format!("{} vertex", p.name), &program.vertex));
+            modules.push((format!("{} fragment", p.name), &program.fragment));
+        }
+        for (name, c) in &p.compute {
+            modules.push((name.clone(), &c.module));
+        }
+    }
+    let (mut panics, mut errors) = (0, 0);
+    for (name, module) in &modules {
+        let info = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(module)
+        .expect("translated modules validate");
+        let Some(entry) = module.entry_points.first() else {
+            continue;
+        };
+        let stage = entry.stage;
+        let point = entry.name.clone();
+        let writers: [(&str, &dyn Fn() -> Result<(), String>); 4] = [
+            ("spv", &|| {
+                use naga::back::spv;
+                let options = spv::Options {
+                    lang_version: (1, 3),
+                    flags: spv::WriterFlags::LABEL_VARYINGS | spv::WriterFlags::FORCE_POINT_SIZE,
+                    bounds_check_policies: naga::proc::BoundsCheckPolicies {
+                        index: naga::proc::BoundsCheckPolicy::Restrict,
+                        buffer: naga::proc::BoundsCheckPolicy::Restrict,
+                        image_load: naga::proc::BoundsCheckPolicy::Restrict,
+                        binding_array: naga::proc::BoundsCheckPolicy::Unchecked,
+                    },
+                    force_loop_bounding: true,
+                    ..Default::default()
+                };
+                let pipeline = spv::PipelineOptions {
+                    shader_stage: stage,
+                    entry_point: point.clone(),
+                };
+                spv::write_vec(module, &info, &options, Some(&pipeline))
+                    .map(drop)
+                    .map_err(|e| e.to_string())
+            }),
+            ("hlsl", &|| {
+                use naga::back::hlsl;
+                let options = hlsl::Options {
+                    shader_model: hlsl::ShaderModel::V6_0,
+                    fake_missing_bindings: true,
+                    ..Default::default()
+                };
+                let pipeline = hlsl::PipelineOptions {
+                    entry_point: Some((stage, point.clone())),
+                };
+                let mut out = String::new();
+                hlsl::Writer::new(&mut out, &options, &pipeline)
+                    .write(module, &info, None)
+                    .map(drop)
+                    .map_err(|e| e.to_string())
+            }),
+            ("glsl", &|| {
+                use naga::back::glsl;
+                let options = glsl::Options {
+                    version: glsl::Version::Desktop(430),
+                    ..Default::default()
+                };
+                let pipeline = glsl::PipelineOptions {
+                    shader_stage: stage,
+                    entry_point: point.clone(),
+                    multiview: None,
+                };
+                let mut out = String::new();
+                glsl::Writer::new(
+                    &mut out,
+                    module,
+                    &info,
+                    &options,
+                    &pipeline,
+                    naga::proc::BoundsCheckPolicies::default(),
+                )
+                .and_then(|mut w| w.write().map(drop))
+                .map_err(|e| e.to_string())
+            }),
+            ("msl", &|| {
+                use naga::back::msl;
+                let options = msl::Options {
+                    lang_version: (2, 4),
+                    fake_missing_bindings: true,
+                    ..Default::default()
+                };
+                msl::write_string(module, &info, &options, &msl::PipelineOptions::default())
+                    .map(drop)
+                    .map_err(|e| e.to_string())
+            }),
+        ];
+        for (backend, write) in writers {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(write)) {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    errors += 1;
+                    println!("    {backend} error: {name}: {e}");
+                }
+                Err(panic) => {
+                    panics += 1;
+                    let message = panic
+                        .downcast_ref::<String>()
+                        .cloned()
+                        .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
+                        .unwrap_or_default();
+                    println!("    {backend} PANIC: {name}: {message}");
+                }
+            }
+        }
+    }
+    println!(
+        "    backends: {} modules, {errors} errors, {panics} panics",
+        modules.len()
+    );
 }
