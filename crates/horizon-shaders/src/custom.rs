@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::Properties;
 
-/// A value: up to 16 components (matrices only as names, for `m.row.column`).
+/// A value: up to 16 components (matrices only as names, for `m.column.row`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Val {
     pub v: [f64; 16],
@@ -63,7 +63,7 @@ impl Val {
 #[derive(Clone, Debug)]
 enum Expr {
     Num(f64),
-    /// A name and its component (`x`, `2`, `2.1` as row 2, column 1).
+    /// A name and its component (`x`, `2`, `2.1` as column 2, row 1).
     Name(String, Option<(usize, Option<usize>)>),
     Call(String, Vec<Expr>, usize),
     Neg(Box<Expr>),
@@ -218,8 +218,9 @@ impl Custom {
                 };
                 match component {
                     None => v,
-                    // GLSL's m[column][row] is stored column after column.
-                    Some((row, Some(column))) => Val::scalar(v.v[column * 4 + row]),
+                    // `m.c.r` is GLSL's m[c][r], stored column after column: packs transform a
+                    // view vector to the world as `inverse.0.0 * x + inverse.1.0 * y + ...`.
+                    Some((column, Some(row))) => Val::scalar(v.v[column * 4 + row]),
                     Some((i, None)) => Val::scalar(v.v[*i]),
                 }
             }
@@ -541,7 +542,7 @@ mod tests {
              uniform.int.d = -7 / 2\n\
              uniform.vec3.e = vec3(a, cameraPosition.y, 2) * 2\n\
              uniform.float.f = if(a < 0, 1, a < 7, 2, 3) + clamp(fmod(-1, 4), 0, 2.5) + min(4, 2, 3)\n\
-             uniform.float.g = gbufferModelView.1.0 + frac(sunAngle - 0.25) + pi * 0\n\
+             uniform.float.g = gbufferModelView.0.1 + frac(sunAngle - 0.25) + pi * 0\n\
              uniform.float.h = unknownThing + in(biome, 3, BIOME_DESERT)\n\
              uniform.int.i = biome == BIOME_PALE_GARDEN || biome == BIOME_OLD\n\
              uniform.int.j = CAT_OCEAN + PPT_RAIN\n",
