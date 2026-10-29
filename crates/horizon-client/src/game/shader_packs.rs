@@ -72,6 +72,9 @@ impl Game<'_> {
                     // Its conditionals test the pack's options too.
                     let properties =
                         Properties::parse(&text, &horizon_shaders::with_options(&pack, &macros));
+                    for note in macros.define_features(&properties) {
+                        log::warn!("shader pack {name}: {note}");
+                    }
                     for note in &properties.notes {
                         log::warn!(
                             "shader pack {name}: shaders.properties:{}: {}",

@@ -562,7 +562,10 @@ impl<'p> Stage<'p> {
                     Some(n) => write!(ty, "{n}]").unwrap(),
                     None => return,
                 },
-                t if ty.is_empty() || t == "[" => ty.push_str(t),
+                // `T[6]`: the size and its `]` belong to the type.
+                t if ty.is_empty() || t == "[" || ty.contains('[') && !ty.ends_with(']') => {
+                    ty.push_str(t)
+                }
                 // Qualifiers before the type (`highp`...): the type is the last word.
                 t => ty = t.to_owned(),
             }

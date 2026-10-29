@@ -3,6 +3,9 @@
 
 use std::collections::BTreeMap;
 
+/// The Iris feature flags (`iris.features.*`) Horizon has.
+const FEATURES: [&str; 2] = ["COMPUTE_SHADERS", "ENTITY_TRANSLUCENT"];
+
 /// `MC_VERSION` of the version Horizon plays: 26.3 → 260300.
 pub const MC_VERSION: u32 = mc_version(horizon_core::version::VERSION_ID);
 
@@ -91,7 +94,31 @@ impl Macros {
         m.define("MC_SHADOW_QUALITY", "1.0");
         m.define("MC_HAND_DEPTH", "0.125");
         m.define("MAX_COLOR_BUFFERS", "16");
+        // Packs take Iris's extensions (compute programs, images, custom textures) where this
+        // is defined.
+        m.define("IS_IRIS", "");
         m
+    }
+
+    /// `iris.features.optional`'s features Horizon has, as `IRIS_FEATURE_<name>`; a note for
+    /// each feature `iris.features.required` names that it lacks.
+    pub fn define_features(&mut self, properties: &crate::Properties) -> Vec<String> {
+        let words = |key: &str| {
+            properties
+                .get(key)
+                .map(|v| v.split_whitespace().map(str::to_owned).collect::<Vec<_>>())
+                .unwrap_or_default()
+        };
+        for feature in words("iris.features.optional") {
+            if FEATURES.contains(&feature.as_str()) {
+                self.define(format!("IRIS_FEATURE_{feature}"), "");
+            }
+        }
+        words("iris.features.required")
+            .into_iter()
+            .filter(|f| !FEATURES.contains(&f.as_str()))
+            .map(|f| format!("the pack requires `{f}`, which is not supported yet"))
+            .collect()
     }
 
     pub fn define(&mut self, name: impl Into<String>, value: impl Into<String>) {

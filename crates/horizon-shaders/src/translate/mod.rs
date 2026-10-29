@@ -1234,6 +1234,17 @@ mod tests {
     }
 
     #[test]
+    fn sized_array_types_initialize_globals() {
+        let fsh = "#version 400\nuniform float k;\nivec3[2] offsets = ivec3[](ivec3(1, 0, 0), ivec3(0, int(k), 0));\n\
+                   out vec4 c;\nvoid main() { c = vec4(offsets[1], 1.0); }\n";
+        program(
+            &[("composite.vsh", VSH_120), ("composite.fsh", fsh)],
+            Target::Buffers,
+        )
+        .unwrap_or_else(|e| panic!("{e:?}"));
+    }
+
+    #[test]
     fn struct_varyings_travel_packed() {
         let lib = "struct Light { vec3 color; float power; int id; mat2 m; float k[2]; };\n";
         let vsh = "#version 400\n#include \"/lib.glsl\"\nflat out Light light;\nvoid main() {\n    \
