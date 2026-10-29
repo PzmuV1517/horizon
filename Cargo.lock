@@ -2219,8 +2219,7 @@ checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 [[package]]
 name = "naga"
 version = "30.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a616d2fb8c89516ac2723a581f69d6c18576046bed761bd6b305e5618e6ae130"
+source = "git+https://github.com/PzmuV1517/wgpu?rev=a5d9da40b2bbc35f8c6c47a7fdfc860f7092c507#a5d9da40b2bbc35f8c6c47a7fdfc860f7092c507"
 dependencies = [
  "arrayvec",
  "bit-set",
@@ -2246,8 +2245,7 @@ dependencies = [
 [[package]]
 name = "naga-types"
 version = "30.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "590afbf58a6f4f62873cd5cff4468061844bafa1cdf399cc954537c22d768d49"
+source = "git+https://github.com/PzmuV1517/wgpu?rev=a5d9da40b2bbc35f8c6c47a7fdfc860f7092c507#a5d9da40b2bbc35f8c6c47a7fdfc860f7092c507"
 dependencies = [
  "hashbrown 0.17.1",
  "indexmap",

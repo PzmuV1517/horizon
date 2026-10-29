@@ -6,7 +6,9 @@ use std::fmt::Write;
 
 use naga::ShaderStage;
 
-use super::scan::{LATER_KEYWORDS, Stage, UNIFORM_STATE, VERTEX_INPUTS, is_ident, significant};
+use super::scan::{
+    LATER_KEYWORDS, Stage, UNIFORM_STATE, VERTEX_INPUTS, is_ident, is_sampler_type, significant,
+};
 use super::{Sampler, split_sampler};
 
 impl Stage<'_> {
@@ -140,7 +142,7 @@ impl Stage<'_> {
                 continue;
             }
             // A function definition's sampler parameters: `sampler2D s` → `texture2D s, sampler hz_s_s`.
-            if depth == 0 && t.contains("sampler") && calls.len() == 1 {
+            if depth == 0 && is_sampler_type(t) && calls.len() == 1 {
                 if let Some(n) = next(i).filter(|&n| is_ident(self.tokens[n])) {
                     let name = self.tokens[n];
                     let (texture, sampler) = split_sampler(t);

@@ -67,6 +67,11 @@ large_enum_variant = "allow"
 # Drop this and the folder once a wgpu release has both fixes.
 [patch.crates-io]
 wgpu-hal = { path = "third_party/wgpu-hal" }
+# naga 30.0.1 with fixes to its GLSL frontend that shader packs need: textureGather, texture() in
+# vertex shaders, structs with array members, vecN(bool) and vector % scalar. Drop this once a
+# naga release has them.
+naga = { git = "https://github.com/PzmuV1517/wgpu", rev = "a5d9da40b2bbc35f8c6c47a7fdfc860f7092c507" }
+naga-types = { git = "https://github.com/PzmuV1517/wgpu", rev = "a5d9da40b2bbc35f8c6c47a7fdfc860f7092c507" }
 
 # Line tables keep file:line in backtraces; full debug info made every
 # example and test binary hundreds of megabytes and slow to link.
