@@ -222,6 +222,80 @@ fn image_buffers(images: &[(u32, Image)]) -> u16 {
 /// The format of the sink of passes that write only images.
 const SINK: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
 
+/// What packs use of the device beyond drawing. OpenGL ES and older drivers lack some of it: a
+/// program that needs what is missing is skipped with a note, and the game runs on without it.
+#[derive(Clone, Copy)]
+struct Gpu {
+    compute: bool,
+    /// Images and storage buffers written by fragment shaders.
+    fragment_storage: bool,
+    /// Storage read and written by vertex shaders (a geometry stage).
+    vertex_storage: bool,
+    /// `clear_texture`; without it images are cleared by copying zeros.
+    clear: bool,
+    adapter_formats: bool,
+}
+
+impl Gpu {
+    fn of(adapter: &wgpu::Adapter, features: wgpu::Features) -> Self {
+        use wgpu::DownlevelFlags as D;
+        let flags = adapter.get_downlevel_capabilities().flags;
+        let mut gpu = Gpu {
+            compute: flags.contains(D::COMPUTE_SHADERS),
+            fragment_storage: flags.contains(D::FRAGMENT_WRITABLE_STORAGE),
+            vertex_storage: flags.contains(D::VERTEX_STORAGE)
+                && features.contains(wgpu::Features::VERTEX_WRITABLE_STORAGE),
+            clear: features.contains(wgpu::Features::CLEAR_TEXTURE),
+            adapter_formats: features
+                .contains(wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES),
+        };
+        // `HORIZON_SHADER_PACK_WITHOUT=compute,fragment-storage,vertex-storage,clear` tries the
+        // fallbacks on a device that has it all.
+        let without = std::env::var("HORIZON_SHADER_PACK_WITHOUT").unwrap_or_default();
+        for w in without.split(',') {
+            match w.trim() {
+                "compute" => gpu.compute = false,
+                "fragment-storage" => gpu.fragment_storage = false,
+                "vertex-storage" => gpu.vertex_storage = false,
+                "clear" => gpu.clear = false,
+                _ => {}
+            }
+        }
+        gpu
+    }
+
+    /// Whether textures of `format` can be bound as images.
+    fn storable(
+        self,
+        adapter: &wgpu::Adapter,
+        format: wgpu::TextureFormat,
+        features: wgpu::Features,
+    ) -> bool {
+        let usages = if self.adapter_formats {
+            adapter.get_texture_format_features(format).allowed_usages
+        } else {
+            format.guaranteed_format_features(features).allowed_usages
+        };
+        (self.compute || self.fragment_storage)
+            && usages.contains(wgpu::TextureUsages::STORAGE_BINDING)
+    }
+
+    /// The stages that may bind images and storage buffers.
+    fn storage_stages(self) -> wgpu::ShaderStages {
+        let mut stages = wgpu::ShaderStages::NONE;
+        if self.compute {
+            stages |= wgpu::ShaderStages::COMPUTE;
+        }
+        if self.fragment_storage {
+            stages |= wgpu::ShaderStages::FRAGMENT;
+        }
+        if self.vertex_storage {
+            stages |= wgpu::ShaderStages::VERTEX;
+        }
+        stages
+    }
+}
+
 /// A pass's pipeline: a draw, or a compute dispatch.
 #[derive(Clone)]
 enum Pipeline {
@@ -436,8 +510,11 @@ pub struct PackPost {
     /// `image.*` and `bufferObject.*`.
     images: Vec<pack_images::PackImage>,
     /// Set 5 of programs with a geometry stage.
-    indices: wgpu::BindGroupLayout,
+    indices: Option<wgpu::BindGroupLayout>,
     shadow_culling: horizon_shaders::ShadowCulling,
+    gpu: Gpu,
+    /// Zeros to clear images by copying, where the device has no `clear_texture`.
+    zeros: Option<wgpu::Buffer>,
     dump: Option<pack_images::Dump>,
     buffers: pack_images::Buffers,
     textures: Vec<pack_textures::PackTexture>,
@@ -841,7 +918,10 @@ struct Resources<'a> {
     images: &'a [pack_images::PackImage],
     buffers: &'a pack_images::Buffers,
     /// Set 5 of a program with a geometry stage: the draw's indices.
-    indices: &'a wgpu::BindGroupLayout,
+    indices: Option<&'a wgpu::BindGroupLayout>,
+    gpu: Gpu,
+    /// The buffers whose format can be bound as an image.
+    storable: u16,
 }
 
 /// A program's bind group layout (its uniform block, samplers and images) and how each sampler
@@ -1058,15 +1138,18 @@ fn bindings(
         } else {
             wgpu::TextureViewDimension::D2
         };
-        // Vertex stages write images too where the device lets them (a geometry stage).
-        let vertex = if features.contains(wgpu::Features::VERTEX_WRITABLE_STORAGE) {
-            wgpu::ShaderStages::VERTEX
-        } else {
-            wgpu::ShaderStages::NONE
-        };
+        if let Image::Color(b) | Image::ColorBefore(b) = target
+            && pack.storable & 1 << b == 0
+        {
+            notes.push(format!(
+                "{name}: `{}` can't be an image on this GPU; skipped",
+                i.name
+            ));
+            return None;
+        }
         entries.push(wgpu::BindGroupLayoutEntry {
             binding: i.binding,
-            visibility: vertex | wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
+            visibility: pack.gpu.storage_stages(),
             ty: wgpu::BindingType::StorageTexture {
                 access,
                 format,
@@ -1156,6 +1239,21 @@ fn build_pass(
     let program = p.program.take()?;
     let interface = &program.interface;
     let draw = interface.draw;
+    let storage = !interface.images.is_empty() || !interface.buffers.is_empty();
+    if storage && !pack.gpu.fragment_storage {
+        notes.push(format!(
+            "{}: this GPU can't write images from a fragment shader; skipped",
+            p.name
+        ));
+        return None;
+    }
+    if p.geometry_triangles > 0 && (pack.indices.is_none() || !pack.gpu.vertex_storage) {
+        notes.push(format!(
+            "{}: this GPU can't run a geometry stage; skipped",
+            p.name
+        ));
+        return None;
+    }
     let (entries, samplers, slots, reads, shadow_reads, images) = bindings(
         features, interface, &p.name, p.group, &p.buffers, geometry, formats, shadow, notes, pack,
     )?;
@@ -1228,7 +1326,7 @@ fn build_pass(
                 draw.then_some(draws),
                 geometry.and_then(|g| g.ids),
                 (!interface.buffers.is_empty()).then_some(&pack.buffers.layout),
-                (p.geometry_triangles > 0).then_some(pack.indices),
+                pack.indices.filter(|_| p.geometry_triangles > 0),
             ],
             ..Default::default()
         });
@@ -1472,6 +1570,7 @@ impl PackPost {
     pub fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
+        adapter: &wgpu::Adapter,
         mut post: Post,
         screen: wgpu::TextureFormat,
         world: World<'_>,
@@ -1516,30 +1615,61 @@ impl PackPost {
                 .map_or(formats[i], |f| f[i])
         });
         let (mut storage, mut copied, mut image_copied) = (0u16, 0u16, 0u16);
-        let images = pack_images::images(std::mem::take(&mut post.images));
-        let buffers = pack_images::Buffers::new(device, std::mem::take(&mut post.buffer_objects));
-        let indices = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Shader pack geometry indices"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: true },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
+        let gpu = Gpu::of(adapter, features);
+        if !gpu.compute {
+            notes.push("this GPU has no compute shaders: compute programs are skipped".into());
+        }
+        // An image whose format the device can't store into: the programs using it are skipped.
+        let mut image_defs = std::mem::take(&mut post.images);
+        image_defs.retain(|def| {
+            let ok = gpu.storable(adapter, pack_images::format(def.format), features);
+            if !ok {
+                notes.push(format!(
+                    "image `{}` can't be an image on this GPU",
+                    def.name
+                ));
+            }
+            ok
+        });
+        let images = pack_images::images(image_defs);
+        let mut objects = std::mem::take(&mut post.buffer_objects);
+        if gpu.storage_stages().is_empty() {
+            objects.clear();
+        }
+        let buffers = pack_images::Buffers::new(device, objects, gpu.storage_stages());
+        let storable = (0..BUFFERS)
+            .filter(|&i| gpu.storable(adapter, formats[i], features))
+            .fold(0u16, |m, i| m | 1 << i);
+        let indices = gpu.vertex_storage.then(|| {
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Shader pack geometry indices"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            })
         });
         let pack = Resources {
             textures: &textures,
             images: &images,
             buffers: &buffers,
-            indices: &indices,
+            indices: indices.as_ref(),
+            gpu,
+            storable,
         };
         let mut build = |mut p: horizon_shaders::PostProgram, geometry: Option<&Geometry<'_>>| {
             let in_shadow = p.group.shadow();
-            let compute = std::mem::take(&mut p.compute);
+            let mut compute = std::mem::take(&mut p.compute);
+            if !gpu.compute {
+                compute.clear();
+                p.program.as_ref()?;
+            }
             let group = p.group;
             let mut computes: Vec<Pass> = compute
                 .into_iter()
@@ -2033,6 +2163,8 @@ impl PackPost {
             buffers,
             indices,
             shadow_culling: post.shadow_culling,
+            gpu,
+            zeros: None,
             dump: pack_images::Dump::new(),
             dummy_3d: device
                 .create_texture(&wgpu::TextureDescriptor {
@@ -2413,7 +2545,11 @@ impl PackPost {
                     rp.set_bind_group(3, group, &[]);
                 }
             };
-            let geometry = (pass.geometry > 0).then_some((pass.geometry, &self.indices));
+            let geometry = self
+                .indices
+                .as_ref()
+                .filter(|_| pass.geometry > 0)
+                .map(|indices| (pass.geometry, indices));
             draw(&mut rp, list, &page, geometry);
         }
         if !pass.group.shadow() {
@@ -3175,7 +3311,13 @@ impl PackPost {
             dump.copy(device, encoder, &self.images);
         }
         pack_images::copy(encoder, &self.images);
-        pack_images::clear(encoder, &self.images);
+        pack_images::clear(
+            device,
+            encoder,
+            &self.images,
+            self.gpu.clear,
+            &mut self.zeros,
+        );
         self.run_shadow(device, queue, encoder, terrain);
         let Some(targets) = &self.targets else { return };
         let main = |m: u16, i: usize| usize::from(m & 1 << i != 0);

@@ -46,7 +46,7 @@ pub(super) fn images(defs: Vec<CustomImage>) -> Vec<PackImage> {
 }
 
 /// The wgpu format of an image's internal format: a storage format of the same channels.
-fn format(f: Format) -> wgpu::TextureFormat {
+pub(super) fn format(f: Format) -> wgpu::TextureFormat {
     use wgpu::TextureFormat as T;
     let pick = |r, rg, rgba| match f.channels {
         1 => r,
@@ -135,14 +135,53 @@ pub(super) fn copy(encoder: &mut wgpu::CommandEncoder, images: &[PackImage]) {
     }
 }
 
-/// Clears the images the pack clears before each frame.
-pub(super) fn clear(encoder: &mut wgpu::CommandEncoder, images: &[PackImage]) {
+/// Clears the images the pack clears before each frame: with `clear_texture` where the device
+/// has it (`clear`), else by copying from `zeros`, a buffer of zeros made large enough.
+pub(super) fn clear(
+    device: &wgpu::Device,
+    encoder: &mut wgpu::CommandEncoder,
+    images: &[PackImage],
+    clear: bool,
+    zeros: &mut Option<wgpu::Buffer>,
+) {
     for view in images
         .iter()
         .filter(|i| i.def.clear)
         .filter_map(|i| i.view.as_ref())
     {
-        encoder.clear_texture(view.texture(), &Default::default());
+        let texture = view.texture();
+        if clear {
+            encoder.clear_texture(texture, &Default::default());
+            continue;
+        }
+        let size = texture.size();
+        let texel = u64::from(texture.format().block_copy_size(None).unwrap_or(4));
+        let row = (u64::from(size.width) * texel).next_multiple_of(256);
+        let bytes = row * u64::from(size.height) * u64::from(size.depth_or_array_layers);
+        if zeros.as_ref().is_none_or(|z| z.size() < bytes) {
+            // New buffers start zeroed.
+            *zeros = Some(device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Shader pack image zeros"),
+                size: bytes,
+                usage: wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            }));
+        }
+        let Some(buffer) = zeros.as_ref() else {
+            continue;
+        };
+        encoder.copy_buffer_to_texture(
+            wgpu::TexelCopyBufferInfo {
+                buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row as u32),
+                    rows_per_image: Some(size.height),
+                },
+            },
+            texture.as_image_copy(),
+            size,
+        );
     }
 }
 
@@ -156,12 +195,17 @@ pub(super) struct Buffers {
 }
 
 impl Buffers {
-    pub(super) fn new(device: &wgpu::Device, objects: BTreeMap<u32, BufferObject>) -> Self {
+    /// The layout of `objects`, bound in `stages`.
+    pub(super) fn new(
+        device: &wgpu::Device,
+        objects: BTreeMap<u32, BufferObject>,
+        stages: wgpu::ShaderStages,
+    ) -> Self {
         let entries: Vec<_> = objects
             .keys()
             .map(|&binding| wgpu::BindGroupLayoutEntry {
                 binding,
-                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT | wgpu::ShaderStages::COMPUTE,
+                visibility: stages,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Storage { read_only: false },
                     has_dynamic_offset: false,
