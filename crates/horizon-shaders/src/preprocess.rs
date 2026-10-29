@@ -16,6 +16,8 @@ use crate::condition::{Conditionals, split_directive};
 use crate::pack::normalize;
 
 const MAX_DEPTH: usize = 10;
+/// How many lines one macro call may span.
+const MAX_CALL_LINES: usize = 64;
 
 /// Where a line came from: an index into [`Preprocessed::files`] and a line number from 1.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -112,6 +114,18 @@ impl Run<'_> {
                 line.push_str(lines[n]);
             }
             n += 1;
+            // A macro call's arguments may span lines: they join the line the call starts on.
+            if !line.trim_start().starts_with('#') && self.conditionals.active() {
+                while n < lines.len()
+                    && n - first < MAX_CALL_LINES
+                    && !lines[n].trim_start().starts_with('#')
+                    && self.macros.unfinished_call(&line)
+                {
+                    line.push(' ');
+                    line.push_str(lines[n]);
+                    n += 1;
+                }
+            }
             let origin = Origin {
                 file,
                 line: first as u32 + 1,
@@ -352,6 +366,25 @@ mod tests {
                 "float v = ((4 + 1) * (4 + 1)) + N2 + 1;",
                 "int l = 7;",
                 "int ok;"
+            ]
+        );
+        assert_eq!(p.lines.len(), p.code.split('\n').count());
+    }
+
+    #[test]
+    fn macro_arguments_span_lines() {
+        let p = run(&[(
+            "program/final.fsh",
+            "#define CLAMP01(x) clamp(x, 0.0, 1.0)\nfloat v = CLAMP01(\n    a * (b\n    + c)\n);\nfloat w;\n",
+        )]);
+        assert_eq!(
+            code_lines(&p),
+            [
+                (
+                    "float v = clamp(a * (b     + c), 0.0, 1.0);",
+                    "program/final.fsh:2".into()
+                ),
+                ("float w;", "program/final.fsh:6".into())
             ]
         );
         assert_eq!(p.lines.len(), p.code.split('\n').count());
