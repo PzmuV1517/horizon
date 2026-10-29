@@ -37,11 +37,11 @@ pub use custom::{Custom, Val};
 pub use discover::{Found, discover};
 pub use lang::Lang;
 pub use macros::{MC_VERSION, Macros, RENDER_STAGES, render_stage};
-pub use options::switches_on;
+pub use options::{switches_on, value_options, with_options};
 pub use pack::{Pack, PackError};
 pub use post::{
-    Blend, CELESTIAL_BLEND, Factor, GameInputs, Group, Post, PostProgram, TRANSLUCENT_BLEND,
-    dimension_folder, load_post,
+    Blend, BufferSize, CELESTIAL_BLEND, Factor, GameInputs, Group, Post, PostProgram,
+    TRANSLUCENT_BLEND, dimension_folder, load_post,
 };
 pub use preprocess::{Diagnostic, Origin, Preprocessed, preprocess};
 pub use properties::{Entry, Note, Properties};
@@ -49,6 +49,7 @@ pub use textures::{
     CustomTexture, Dim as TextureDim, Texels, Texture, TextureSource, decode_png, load_textures,
 };
 pub use translate::{
-    AlphaTest, DRAW_UNIFORMS, Error, GbuffersInputs, Interface, Program, Sampler, Target, Uniform,
-    translate_composite, translate_gbuffers, translate_shadow,
+    AlphaTest, ComputeProgram, DRAW_UNIFORMS, Error, GbuffersInputs, Image, Interface, Program,
+    Sampler, Target, Uniform, translate_composite, translate_compute, translate_gbuffers,
+    translate_shadow,
 };

@@ -62,7 +62,7 @@ impl Stage<'_> {
                  vec4 hz_MultiTexCoord0; vec4 hz_MultiTexCoord1; vec4 hz_MultiTexCoord2; vec4 hz_MultiTexCoord3;\n\
                  vec4 hz_MultiTexCoord4; vec4 hz_MultiTexCoord5; vec4 hz_MultiTexCoord6; vec4 hz_MultiTexCoord7;\n",
             );
-        } else {
+        } else if self.kind == ShaderStage::Fragment {
             for n in &self.outputs {
                 if !self.frag_outs.iter().any(|(at, _)| at == n) {
                     writeln!(p, "layout(location = {n}) out vec4 hz_out{n};").unwrap();

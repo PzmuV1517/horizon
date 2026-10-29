@@ -176,11 +176,24 @@ impl Entities {
     }
 }
 
+/// A pass's pipeline: a draw, or a compute dispatch.
+#[derive(Clone)]
+enum Pipeline {
+    Render(wgpu::RenderPipeline),
+    Compute {
+        pipeline: wgpu::ComputePipeline,
+        /// `workGroups`, else `workGroupsRender` and the local size.
+        groups: Option<[u32; 3]>,
+        render: [f32; 2],
+        local: [u32; 3],
+    },
+}
+
 #[derive(Clone)]
 struct Pass {
     name: String,
     group: Group,
-    pipeline: wgpu::RenderPipeline,
+    pipeline: Pipeline,
     layout: wgpu::BindGroupLayout,
     ubo: wgpu::Buffer,
     block: Vec<u8>,
@@ -208,6 +221,22 @@ struct Pass {
     /// Bind groups by the sides read (bits 0–15), the buffers whose mip chain is current (bits
     /// 16–31) and the shadowcolor sides read (bits 32–33).
     groups: HashMap<u64, wgpu::BindGroup>,
+    /// (binding, buffer) of each image: the side the buffer's sampler reads.
+    images: Vec<(u32, usize)>,
+    /// Buffers both sampled and bound as images: sampled from a copy taken first, as wgpu binds
+    /// a texture one way per pass.
+    copies: u16,
+    /// Compute programs dispatched before this pass.
+    compute: Vec<Pass>,
+}
+
+impl Pass {
+    fn render(&self) -> &wgpu::RenderPipeline {
+        match &self.pipeline {
+            Pipeline::Render(p) => p,
+            Pipeline::Compute { .. } => unreachable!("a compute pass draws nothing"),
+        }
+    }
 }
 
 /// One side of a buffer with mipmaps.
@@ -228,6 +257,10 @@ struct Targets {
     depth1: Option<(wgpu::Texture, wgpu::TextureView)>,
     /// Both sides' mip chains of the buffers with mipmaps (`color` is their first level).
     mips: [Option<[Mips; 2]>; BUFFERS],
+    /// Where a pass that both samples and stores a buffer samples it from.
+    scratch: [Option<wgpu::TextureView>; BUFFERS],
+    /// Each buffer's size: the render size, or its `size.buffer`.
+    sizes: [[u32; 2]; BUFFERS],
 }
 
 /// What a pack's gbuffers programs read and draw from the game's world.
@@ -285,6 +318,12 @@ pub struct PackPost {
     /// The pack has `gbuffers_clouds`, even one that writes nothing (a pack drawing its own
     /// clouds discards vanilla's): the game's clouds are not drawn.
     hides_clouds: bool,
+    /// The pack has a sky (`gbuffers_skybasic`) or sun and moon (`gbuffers_skytextured`)
+    /// program: vanilla's stays hidden even when the program writes nothing.
+    hides_sky: bool,
+    hides_celestial: bool,
+    /// `colortex0ClearColor`, when the pack sets it.
+    sky_clear: Option<[f32; 4]>,
     /// What draws rain and snow (the same program, each with its kind's sprite as `texture`),
     /// after translucent terrain, this frame's weather and the sprites' generation bound.
     weather: Option<[Pass; 2]>,
@@ -324,6 +363,11 @@ pub struct PackPost {
     formats: [wgpu::TextureFormat; BUFFERS],
     clears: [Option<[f32; 4]>; BUFFERS],
     used: u16,
+    /// `size.buffer.*`.
+    sizes: [Option<horizon_shaders::BufferSize>; BUFFERS],
+    /// Buffers bound as images, and those also copied for a pass that samples them.
+    storage: u16,
+    copied: u16,
     /// Bit n set: B is buffer n's "main".
     main: u16,
     targets: Option<Targets>,
@@ -568,7 +612,7 @@ fn helper(
 fn entry(binding: u32, ty: wgpu::BindingType) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
-        visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+        visibility: wgpu::ShaderStages::VERTEX_FRAGMENT | wgpu::ShaderStages::COMPUTE,
         ty,
         count: None,
     }
@@ -716,34 +760,28 @@ pub(super) struct Geometry<'a> {
     pub cull: bool,
 }
 
-/// The pass of program `p`: a quad, or `geometry` drawn by the game. `None` (with a note) when
-/// wgpu refuses it or it writes nothing. `formats` are its buffers' (for a program of the shadow
-/// buffers, buffer n is shadowcolor n); `shadow` the shadowcolor formats when the shadow pass
-/// runs.
-#[allow(clippy::too_many_arguments)]
-fn build_pass(
-    device: &wgpu::Device,
-    p: horizon_shaders::PostProgram,
+/// A program's bind group layout (its uniform block, samplers and images) and how each sampler
+/// and image binds. `None` (with a note) for an image the game can't give it.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn bindings(
+    features: wgpu::Features,
+    interface: &horizon_shaders::Interface,
+    name: &str,
+    group: Group,
+    buffers: &[u32],
+    geometry: Option<&Geometry<'_>>,
     formats: &[wgpu::TextureFormat; BUFFERS],
     shadow: Option<&[wgpu::TextureFormat; 2]>,
-    screen: wgpu::TextureFormat,
     notes: &mut Vec<String>,
-    geometry: Option<&Geometry<'_>>,
-    custom: &[String],
-    draws: &wgpu::BindGroupLayout,
     textures: &[pack_textures::PackTexture],
-) -> Option<Pass> {
-    let features = device.features();
-    // The frame's uniforms, then the pack's custom ones.
-    let index = |name: &str| {
-        pack_uniforms::index(name).or_else(|| {
-            let k = custom.iter().position(|c| c == name)?;
-            Some(pack_uniforms::NAMES.len() + k)
-        })
-    };
-    let mask = |flips: &[(u32, bool)]| flips.iter().filter(|f| f.1).fold(0u16, |m, f| m | 1 << f.0);
-    let interface = &p.program.interface;
-    let draw = interface.draw;
+) -> Option<(
+    Vec<wgpu::BindGroupLayoutEntry>,
+    Vec<Binding>,
+    HashMap<u32, u32>,
+    u16,
+    u16,
+    Vec<(u32, usize)>,
+)> {
     let mut entries = vec![entry(
         0,
         wgpu::BindingType::Buffer {
@@ -760,12 +798,12 @@ fn build_pass(
     // A gbuffers pass draws into its buffers and the depth buffer: reading them as well would
     // be a feedback loop (undefined in GL, refused by wgpu), so those read a blank texture.
     let in_place = match geometry {
-        Some(_) => p.buffers.iter().fold(0u16, |m, &b| m | 1 << b),
+        Some(_) => buffers.iter().fold(0u16, |m, &b| m | 1 << b),
         None => 0,
     };
     for s in &interface.samplers {
         let float = wgpu::TextureSampleType::Float { filterable: true };
-        let custom = pack_textures::find(textures, p.group, &s.ty, &s.name);
+        let custom = pack_textures::find(textures, group, &s.ty, &s.name);
         let (src, sample_type, dimension) = match custom {
             Some(i) => {
                 let t = &textures[i];
@@ -781,14 +819,14 @@ fn build_pass(
                 (src, t.sample_type, t.dimension)
             }
             None => {
-                let mut src = source(&s.name, p.group.shadow(), shadow.is_some(), watershadow);
+                let mut src = source(&s.name, group.shadow(), shadow.is_some(), watershadow);
                 let blank = match src {
                     // The shadow pass writes the shadow map.
-                    Source::ShadowDepth(..) => p.group == Group::Shadow,
+                    Source::ShadowDepth(..) => group == Group::Shadow,
                     Source::Atlas => geometry.is_none(),
                     Source::Depth => geometry.is_some(),
                     // Translucent terrain reads the copy; opaque terrain would read itself.
-                    Source::Depth1 => p.group == Group::Gbuffers,
+                    Source::Depth1 => group == Group::Gbuffers,
                     Source::Color(n) => in_place & 1 << n != 0,
                     _ => false,
                 };
@@ -824,7 +862,7 @@ fn build_pass(
                 if !wanted {
                     notes.push(format!(
                         "{}: `{} {}` is not provided yet",
-                        p.name, s.ty, s.name
+                        name, s.ty, s.name
                     ));
                     (src, sample_type) = (Source::Dummy, float);
                 }
@@ -869,6 +907,127 @@ fn build_pass(
             dimension,
         });
     }
+    let mut images = Vec::new();
+    for i in &interface.images {
+        let buffer = i
+            .name
+            .strip_prefix("colorimg")
+            .and_then(|n| n.parse::<usize>().ok())
+            .filter(|&n| n < BUFFERS && !group.shadow());
+        let (Some(buffer), Some(format)) = (buffer, image_format(&i.format)) else {
+            notes.push(format!("{name}: image `{}` is not provided yet", i.name));
+            return None;
+        };
+        if formats[buffer] != format {
+            notes.push(format!(
+                "{name}: `{}` is {} but colortex{buffer} is {:?}",
+                i.name, i.format, formats[buffer]
+            ));
+            return None;
+        }
+        let access = match i.access.as_str() {
+            "writeonly" => wgpu::StorageTextureAccess::WriteOnly,
+            "readonly" => wgpu::StorageTextureAccess::ReadOnly,
+            _ => wgpu::StorageTextureAccess::ReadWrite,
+        };
+        let dimension = match i.ty.trim_start_matches(['i', 'u']) {
+            "image3D" => wgpu::TextureViewDimension::D3,
+            _ => wgpu::TextureViewDimension::D2,
+        };
+        entries.push(wgpu::BindGroupLayoutEntry {
+            binding: i.binding,
+            visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::StorageTexture {
+                access,
+                format,
+                view_dimension: dimension,
+            },
+            count: None,
+        });
+        images.push((i.binding, buffer));
+    }
+    Some((entries, samplers, slots, reads, shadow_reads, images))
+}
+
+/// The wgpu format of an image's format qualifier.
+fn image_format(qualifier: &str) -> Option<wgpu::TextureFormat> {
+    use wgpu::TextureFormat as T;
+    Some(match qualifier {
+        "rgba32f" => T::Rgba32Float,
+        "rgba16f" => T::Rgba16Float,
+        "rg32f" => T::Rg32Float,
+        "rg16f" => T::Rg16Float,
+        "r11f_g11f_b10f" => T::Rg11b10Ufloat,
+        "r32f" => T::R32Float,
+        "r16f" => T::R16Float,
+        "rgba16" => T::Rgba16Unorm,
+        "rgb10_a2" => T::Rgb10a2Unorm,
+        "rgba8" => T::Rgba8Unorm,
+        "rg16" => T::Rg16Unorm,
+        "rg8" => T::Rg8Unorm,
+        "r16" => T::R16Unorm,
+        "r8" => T::R8Unorm,
+        "rgba16_snorm" => T::Rgba16Snorm,
+        "rgba8_snorm" => T::Rgba8Snorm,
+        "rg16_snorm" => T::Rg16Snorm,
+        "rg8_snorm" => T::Rg8Snorm,
+        "r16_snorm" => T::R16Snorm,
+        "r8_snorm" => T::R8Snorm,
+        "rgba32i" => T::Rgba32Sint,
+        "rgba16i" => T::Rgba16Sint,
+        "rgba8i" => T::Rgba8Sint,
+        "rg32i" => T::Rg32Sint,
+        "rg16i" => T::Rg16Sint,
+        "rg8i" => T::Rg8Sint,
+        "r32i" => T::R32Sint,
+        "r16i" => T::R16Sint,
+        "r8i" => T::R8Sint,
+        "rgba32ui" => T::Rgba32Uint,
+        "rgba16ui" => T::Rgba16Uint,
+        "rgb10_a2ui" => T::Rgb10a2Uint,
+        "rgba8ui" => T::Rgba8Uint,
+        "rg32ui" => T::Rg32Uint,
+        "rg16ui" => T::Rg16Uint,
+        "rg8ui" => T::Rg8Uint,
+        "r32ui" => T::R32Uint,
+        "r16ui" => T::R16Uint,
+        "r8ui" => T::R8Uint,
+        _ => return None,
+    })
+}
+
+/// The pass of program `p`: a quad, or `geometry` drawn by the game. `None` (with a note) when
+/// wgpu refuses it or it writes nothing. `formats` are its buffers' (for a program of the shadow
+/// buffers, buffer n is shadowcolor n); `shadow` the shadowcolor formats when the shadow pass
+/// runs.
+#[allow(clippy::too_many_arguments)]
+fn build_pass(
+    device: &wgpu::Device,
+    p: horizon_shaders::PostProgram,
+    formats: &[wgpu::TextureFormat; BUFFERS],
+    shadow: Option<&[wgpu::TextureFormat; 2]>,
+    screen: wgpu::TextureFormat,
+    notes: &mut Vec<String>,
+    geometry: Option<&Geometry<'_>>,
+    custom: &[String],
+    draws: &wgpu::BindGroupLayout,
+    textures: &[pack_textures::PackTexture],
+) -> Option<Pass> {
+    let features = device.features();
+    // The frame's uniforms, then the pack's custom ones.
+    let index = |name: &str| {
+        pack_uniforms::index(name).or_else(|| {
+            let k = custom.iter().position(|c| c == name)?;
+            Some(pack_uniforms::NAMES.len() + k)
+        })
+    };
+    let mask = |flips: &[(u32, bool)]| flips.iter().filter(|f| f.1).fold(0u16, |m, f| m | 1 << f.0);
+    let interface = &p.program.interface;
+    let draw = interface.draw;
+    let (entries, samplers, slots, reads, shadow_reads, images) = bindings(
+        features, interface, &p.name, p.group, &p.buffers, geometry, formats, shadow, notes,
+        textures,
+    )?;
     let final_pass = p.group == Group::Final;
     let mut targets = Vec::new();
     let mut writes = Vec::new();
@@ -1006,12 +1165,11 @@ fn build_pass(
             .collect(),
         name: p.name,
         group: p.group,
-        pipeline,
+        pipeline: Pipeline::Render(pipeline),
         layout,
         samplers,
         writes,
         flip,
-        reads,
         shadow_reads,
         written,
         mipmaps: p.mipmaps,
@@ -1019,6 +1177,117 @@ fn build_pass(
         atlas: geometry.and_then(|g| g.atlas.clone()),
         ids: geometry.is_some_and(|g| g.ids.is_some()),
         groups: HashMap::new(),
+        copies: images.iter().fold(0, |m, i| m | 1 << i.1) & reads,
+        reads: reads | images.iter().fold(0, |m, i| m | 1 << i.1),
+        images,
+        compute: Vec::new(),
+    })
+}
+
+/// The pass of compute program `c` of a `group` program: `None` (with a note) when wgpu refuses
+/// it or it needs what the game can't give.
+#[allow(clippy::too_many_arguments)]
+fn build_compute(
+    device: &wgpu::Device,
+    name: String,
+    group: Group,
+    c: horizon_shaders::ComputeProgram,
+    formats: &[wgpu::TextureFormat; BUFFERS],
+    shadow: Option<&[wgpu::TextureFormat; 2]>,
+    notes: &mut Vec<String>,
+    custom: &[String],
+    textures: &[pack_textures::PackTexture],
+) -> Option<Pass> {
+    let index = |name: &str| {
+        pack_uniforms::index(name).or_else(|| {
+            let k = custom.iter().position(|c| c == name)?;
+            Some(pack_uniforms::NAMES.len() + k)
+        })
+    };
+    let interface = &c.interface;
+    let (entries, samplers, slots, reads, shadow_reads, images) = bindings(
+        device.features(),
+        interface,
+        &name,
+        group,
+        &[],
+        None,
+        formats,
+        shadow,
+        notes,
+        textures,
+    )?;
+    let local = c.module.entry_points[0].workgroup_size;
+    let created = checked(device, || {
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some(&name),
+            entries: &entries,
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some(&name),
+            bind_group_layouts: &[Some(&layout)],
+            ..Default::default()
+        });
+        let mut module = c.module;
+        share_samplers(&mut module, &slots);
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some(&name),
+            source: wgpu::ShaderSource::Naga(std::borrow::Cow::Owned(module)),
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(&name),
+            layout: Some(&pipeline_layout),
+            module: &module,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        (layout, pipeline)
+    });
+    let (layout, pipeline) = match created {
+        Ok(created) => created,
+        Err(e) => {
+            notes.push(format!("{name}: skipped: {e}"));
+            return None;
+        }
+    };
+    let written = images.iter().fold(0u16, |m, i| m | 1 << i.1);
+    Some(Pass {
+        ubo: device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(&name),
+            size: u64::from(interface.uniform_size.max(16)),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }),
+        block: vec![0; interface.uniform_size as usize],
+        uniforms: interface
+            .uniforms
+            .iter()
+            .map(|u| (index(&u.name), u.ty.clone(), u.offset))
+            .collect(),
+        name,
+        group,
+        pipeline: Pipeline::Compute {
+            pipeline,
+            groups: c.work_groups,
+            render: c.work_groups_render,
+            local,
+        },
+        layout,
+        samplers,
+        writes: Vec::new(),
+        flip: 0,
+        copies: written & reads,
+        reads: reads | written,
+        shadow_reads,
+        written,
+        mipmaps: 0,
+        draw: false,
+        atlas: None,
+        ids: false,
+        groups: HashMap::new(),
+        images,
+        compute: Vec::new(),
     })
 }
 
@@ -1034,6 +1303,9 @@ impl PackPost {
         let features = device.features();
         let formats: [wgpu::TextureFormat; BUFFERS] =
             std::array::from_fn(|i| texture_format(post.config.buffers[i].format, features));
+        let sky_clear = Some(&post.config.buffers[0])
+            .filter(|b| b.clear)
+            .and_then(|b| b.clear_color);
         let clears = std::array::from_fn(|i| {
             let b = &post.config.buffers[i];
             b.clear.then(|| {
@@ -1067,9 +1339,12 @@ impl PackPost {
                 .filter(|_| i < 2)
                 .map_or(formats[i], |f| f[i])
         });
-        let mut build = |p: horizon_shaders::PostProgram, geometry: Option<&Geometry<'_>>| {
+        let (mut storage, mut copied) = (0u16, 0u16);
+        let mut build = |mut p: horizon_shaders::PostProgram, geometry: Option<&Geometry<'_>>| {
             let in_shadow = p.group.shadow();
-            let pass = build_pass(
+            let compute = std::mem::take(&mut p.compute);
+            let group = p.group;
+            let mut pass = build_pass(
                 device,
                 p,
                 if in_shadow { &shadow_space } else { &formats },
@@ -1081,8 +1356,25 @@ impl PackPost {
                 &draws.layout,
                 &textures,
             )?;
-            if !in_shadow {
-                used |= pass.reads | pass.written | pass.flip;
+            for (name, c) in compute {
+                pass.compute.extend(build_compute(
+                    device,
+                    name,
+                    group,
+                    c,
+                    if in_shadow { &shadow_space } else { &formats },
+                    shadow_formats.as_ref(),
+                    &mut notes,
+                    &custom_names,
+                    &textures,
+                ));
+            }
+            for p in std::iter::once(&pass).chain(&pass.compute) {
+                if !in_shadow {
+                    used |= p.reads | p.written | p.flip;
+                }
+                storage |= p.images.iter().fold(0, |m, i| m | 1 << i.1);
+                copied |= p.copies;
             }
             Some(pass)
         };
@@ -1116,6 +1408,7 @@ impl PackPost {
             .shadow_water
             .zip(terrain_geometry.as_ref())
             .and_then(|(p, g)| build(p, Some(g)));
+        let (hides_sky, hides_celestial) = (post.sky.is_some(), post.sky_textured.is_some());
         let sky = (post.sky.is_some() || post.sky_textured.is_some()).then(|| {
             let geometry = PackSky::new(device);
             let basic = Geometry {
@@ -1383,8 +1676,11 @@ impl PackPost {
                     .iter()
                     .any(|s| matches!(s.source, Source::Depth | Source::Depth1))
             });
+        // Buffers of a size of their own clear apart from the blit, which writes colortex0.
+        let (mut cleared, mut other_clears): (Vec<usize>, Vec<usize>) =
+            cleared.into_iter().partition(|&b| post.sizes[b].is_none());
         let room = 8 - 1;
-        let other_clears = cleared.split_off(room.min(cleared.len()));
+        other_clears.extend(cleared.split_off(room.min(cleared.len())));
         let float = wgpu::TextureSampleType::Float { filterable: true };
         let blit_targets = std::iter::once(target(formats[0]));
         // Cleared by the pass's load operation; the shader writes nothing there.
@@ -1477,6 +1773,9 @@ impl PackPost {
             clouds,
             cloud_draw: None,
             hides_clouds,
+            hides_sky,
+            hides_celestial,
+            sky_clear,
             weather,
             weather_draw: None,
             weather_generation: 0,
@@ -1501,6 +1800,9 @@ impl PackPost {
             formats,
             clears,
             used,
+            storage,
+            copied,
+            sizes: post.sizes,
             blit_depth,
             blit_clears: cleared,
             other_clears,
@@ -1646,6 +1948,9 @@ impl PackPost {
                         },
                         None => &self.shadow.0,
                     },
+                    Source::Color(i) if pass.copies & 1 << i != 0 => {
+                        targets.scratch[i].as_ref().unwrap_or(&self.dummy)
+                    }
                     Source::Color(i) => {
                         let side = usize::from(key & 1 << i != 0);
                         match (&targets.mips[i], &targets.color[i]) {
@@ -1702,6 +2007,15 @@ impl PackPost {
                     });
                 }
             }
+            // An image is the side its buffer's sampler reads.
+            for &(binding, i) in &pass.images {
+                let side = usize::from(key & 1 << i != 0);
+                let view = targets.color[i].as_ref().map_or(&self.dummy, |t| &t[side]);
+                entries.push(wgpu::BindGroupEntry {
+                    binding,
+                    resource: wgpu::BindingResource::TextureView(view),
+                });
+            }
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some(&pass.name),
                 layout: &pass.layout,
@@ -1709,6 +2023,52 @@ impl PackPost {
             })
         });
         group.clone()
+    }
+
+    /// Dispatches compute pass `pass` over a target of `size`: its sampled copies first.
+    fn dispatch(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        pass: &mut Pass,
+        size: [u32; 2],
+    ) {
+        let Pipeline::Compute {
+            pipeline,
+            groups,
+            render,
+            local,
+        } = &pass.pipeline
+        else {
+            return;
+        };
+        let groups = groups.unwrap_or_else(|| {
+            let n = |k: usize| (size[k] as f32 * render[k] / local[k] as f32).ceil() as u32;
+            [n(0), n(1), 1]
+        });
+        let (pipeline, groups) = (pipeline.clone(), groups);
+        let targets = self.targets.as_ref().expect("resized");
+        for i in (0..BUFFERS).filter(|i| pass.copies & 1 << i != 0) {
+            if let (Some(t), Some(copy)) = (&targets.color[i], &targets.scratch[i]) {
+                let side = usize::from(self.main & 1 << i != 0);
+                encoder.copy_texture_to_texture(
+                    t[side].texture().as_image_copy(),
+                    copy.texture().as_image_copy(),
+                    t[side].texture().size(),
+                );
+            }
+        }
+        let group = self.bind(device, queue, pass, size);
+        let mut cp = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some(&pass.name),
+            timestamp_writes: None,
+        });
+        cp.set_pipeline(&pipeline);
+        cp.set_bind_group(0, &group, &[]);
+        cp.dispatch_workgroups(groups[0], groups[1], groups[2]);
+        drop(cp);
+        self.mips_valid &= !pass.written;
     }
 
     /// A render pass into the buffers `pass` writes, in place, tested against the world's depth.
@@ -1792,7 +2152,7 @@ impl PackPost {
         let group = self.bind(device, queue, &mut pass, size);
         {
             let mut rp = self.begin(encoder, &pass);
-            rp.set_pipeline(&pass.pipeline);
+            rp.set_pipeline(pass.render());
             rp.set_bind_group(0, &group, &[]);
             if pass.draw {
                 let stage = if translucent {
@@ -1861,7 +2221,7 @@ impl PackPost {
                     open = Some((self.begin(encoder, pass).forget_lifetime(), i));
                 }
                 let rp = &mut open.as_mut().expect("open").0;
-                rp.set_pipeline(&pass.pipeline);
+                rp.set_pipeline(pass.render());
                 rp.set_bind_group(0, group, &[]);
                 sky.geometry.bind(rp, part.textured);
                 open.as_mut().expect("open").1 = i;
@@ -1906,7 +2266,7 @@ impl PackPost {
             let group = self.bind(device, queue, pass, size);
             {
                 let mut rp = self.begin(encoder, pass);
-                rp.set_pipeline(&pass.pipeline);
+                rp.set_pipeline(pass.render());
                 rp.set_bind_group(0, &group, &[]);
                 rp.set_bind_group(1, &geometry.table_group, &[]);
                 rp.set_vertex_buffer(0, geometry.vertices());
@@ -1948,7 +2308,7 @@ impl PackPost {
             }
             let group = self.bind(device, queue, pass, size);
             let mut rp = self.begin(encoder, pass);
-            rp.set_pipeline(&pass.pipeline);
+            rp.set_pipeline(pass.render());
             rp.set_bind_group(0, &group, &[]);
             rp.set_bind_group(1, &geometry.table_group, &[]);
             rp.set_vertex_buffer(0, geometry.vertices());
@@ -2056,7 +2416,7 @@ impl PackPost {
             let group = self.bind(device, queue, &mut pass, size);
             {
                 let mut rp = self.begin(encoder, &pass);
-                rp.set_pipeline(&pass.pipeline);
+                rp.set_pipeline(pass.render());
                 rp.set_bind_group(0, &group, &[]);
                 rp.set_bind_group(1, &geometry.group, &[]);
                 if pass.draw {
@@ -2090,7 +2450,7 @@ impl PackPost {
         let group = self.bind(device, queue, &mut pass, size);
         {
             let mut rp = self.begin(encoder, &pass);
-            rp.set_pipeline(&pass.pipeline);
+            rp.set_pipeline(pass.render());
             rp.set_bind_group(0, &group, &[]);
             rp.set_bind_group(1, &clouds.group, &[]);
             if pass.draw {
@@ -2161,7 +2521,7 @@ impl PackPost {
             let group = self.bind(device, queue, pass, size);
             {
                 let mut rp = self.begin(encoder, pass);
-                rp.set_pipeline(&pass.pipeline);
+                rp.set_pipeline(pass.render());
                 rp.set_bind_group(0, &group, &[]);
                 if pass.draw {
                     self.draws.bind(&mut rp, "RAIN_SNOW");
@@ -2231,13 +2591,19 @@ impl PackPost {
     }
 
     /// Whether the pack draws the sky (disc, sunset, stars, void) itself.
+    /// What the world's background is when the pack draws the sky: colortex0's clear colour
+    /// (`None`: the fog colour, its default).
+    pub fn sky_clear(&self) -> Option<[f32; 4]> {
+        self.sky_clear.filter(|_| self.has_sky())
+    }
+
     pub fn has_sky(&self) -> bool {
-        self.sky.as_ref().is_some_and(|s| s.basic.is_some())
+        self.hides_sky && self.sky.is_some()
     }
 
     /// Whether the pack draws the sun and moon itself.
     pub fn has_celestial(&self) -> bool {
-        self.sky.as_ref().is_some_and(|s| s.textured.is_some())
+        self.hides_celestial && self.sky.is_some()
     }
 
     /// Whether the pack draws translucent terrain itself.
@@ -2254,8 +2620,10 @@ impl PackPost {
         if self.targets.as_ref().is_some_and(|t| t.size == size) {
             return;
         }
-        let full_chain = 32 - size[0].max(size[1]).max(1).leading_zeros();
-        let texture_levels = |label: &str, format, usage, levels| {
+        let sizes: [[u32; 2]; BUFFERS] =
+            std::array::from_fn(|i| self.sizes[i].map_or(size, |s| s.resolve(size)));
+        let full_chain = |size: [u32; 2]| 32 - size[0].max(size[1]).max(1).leading_zeros();
+        let texture_sized = |label: &str, format, usage, levels, size: [u32; 2]| {
             device.create_texture(&wgpu::TextureDescriptor {
                 label: Some(label),
                 size: wgpu::Extent3d {
@@ -2271,7 +2639,7 @@ impl PackPost {
                 view_formats: &[],
             })
         };
-        let texture = |label: &str, format, usage| texture_levels(label, format, usage, 1);
+        let texture = |label: &str, format, usage| texture_sized(label, format, usage, 1, size);
         let level = |t: &wgpu::Texture, level: u32| {
             t.create_view(&wgpu::TextureViewDescriptor {
                 base_mip_level: level,
@@ -2284,10 +2652,16 @@ impl PackPost {
             (self.used & 1 << i != 0).then(|| {
                 let label = format!("colortex{i}");
                 let mipped = self.mipped & 1 << i != 0;
-                let levels = if mipped { full_chain } else { 1 };
-                let attachment = wgpu::TextureUsages::RENDER_ATTACHMENT;
-                let sides =
-                    [0, 1].map(|_| texture_levels(&label, self.formats[i], attachment, levels));
+                let levels = if mipped { full_chain(sizes[i]) } else { 1 };
+                let mut attachment = wgpu::TextureUsages::RENDER_ATTACHMENT;
+                if self.storage & 1 << i != 0 {
+                    attachment |= wgpu::TextureUsages::STORAGE_BINDING;
+                }
+                if self.copied & 1 << i != 0 {
+                    attachment |= wgpu::TextureUsages::COPY_SRC;
+                }
+                let sides = [0, 1]
+                    .map(|_| texture_sized(&label, self.formats[i], attachment, levels, sizes[i]));
                 if mipped && let Some((_, layout)) = self.down.get(&self.formats[i]) {
                     mips[i] = Some(sides.each_ref().map(|t| {
                         Mips {
@@ -2333,8 +2707,22 @@ impl PackPost {
             let view = t.create_view(&Default::default());
             (t, view)
         });
+        let scratch = std::array::from_fn(|i| {
+            (self.copied & 1 << i != 0).then(|| {
+                texture_sized(
+                    &format!("colortex{i} copy"),
+                    self.formats[i],
+                    wgpu::TextureUsages::COPY_DST,
+                    1,
+                    sizes[i],
+                )
+                .create_view(&Default::default())
+            })
+        });
         self.targets = Some(Targets {
             size,
+            sizes,
+            scratch,
             color,
             depth: depth_texture.create_view(&Default::default()),
             depth_texture,
@@ -2405,7 +2793,7 @@ impl PackPost {
                     timestamp_writes: self.timing.as_mut().and_then(|t| t.writes(&pass.name)),
                     ..Default::default()
                 });
-                rp.set_pipeline(&pass.pipeline);
+                rp.set_pipeline(pass.render());
                 rp.set_bind_group(0, &group, &[]);
                 rp.draw(0..6, 0..1);
             }
@@ -2508,7 +2896,16 @@ impl PackPost {
             load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
             store: wgpu::StoreOp::Store,
         };
-        for chunk in self.other_clears.chunks(8) {
+        // Attachments of a pass share a size.
+        let mut by_size: Vec<([u32; 2], Vec<usize>)> = Vec::new();
+        for &b in &self.other_clears {
+            let at = targets.sizes[b];
+            match by_size.iter_mut().find(|(s, l)| *s == at && l.len() < 8) {
+                Some((_, l)) => l.push(b),
+                None => by_size.push((at, vec![b])),
+            }
+        }
+        for (_, chunk) in &by_size {
             let attachments: Vec<_> = chunk
                 .iter()
                 .map(|&b| attach(view(self.main, b, false).expect("used buffer"), clear_op(b)))
@@ -2605,13 +3002,24 @@ impl PackPost {
                 seen.1 = true;
                 self.main ^= self.composite_pre;
             }
+            let mut compute = std::mem::take(&mut pass.compute);
+            for c in &mut compute {
+                self.dispatch(device, queue, encoder, c, size);
+            }
+            pass.compute = compute;
             let stale = pass.mipmaps & self.mipped & !self.mips_valid;
             for b in (0..BUFFERS).filter(|b| stale & 1 << b != 0) {
                 self.mipmap(encoder, b);
             }
             self.mips_valid |= stale;
             let final_pass = pass.group == Group::Final;
-            let group = self.bind(device, queue, pass, if final_pass { window } else { size });
+            // A pass writing buffers of a size of their own draws at that size (they share it).
+            let out = match pass.writes.first() {
+                _ if final_pass => window,
+                Some(&(_, b)) => self.targets.as_ref().map_or(size, |t| t.sizes[b]),
+                None => size,
+            };
+            let group = self.bind(device, queue, pass, out);
             let targets = self.targets.as_ref().expect("resized");
             let view = |i: usize| {
                 targets.color[i]
@@ -2638,7 +3046,7 @@ impl PackPost {
                     timestamp_writes: self.timing.as_mut().and_then(|t| t.writes(&pass.name)),
                     ..Default::default()
                 });
-                rp.set_pipeline(&pass.pipeline);
+                rp.set_pipeline(pass.render());
                 rp.set_bind_group(0, &group, &[]);
                 rp.draw(0..6, 0..1);
             }

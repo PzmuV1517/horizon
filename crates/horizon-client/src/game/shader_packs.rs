@@ -66,9 +66,12 @@ impl Game<'_> {
             let started = std::time::Instant::now();
             match Pack::open(&path) {
                 Ok(pack) => {
-                    let macros = Macros::standard();
+                    let mut macros = Macros::standard();
+                    renderer.define_pack_macros(&mut macros);
                     let text = pack.read_text("shaders.properties").unwrap_or_default();
-                    let properties = Properties::parse(&text, &macros);
+                    // Its conditionals test the pack's options too.
+                    let properties =
+                        Properties::parse(&text, &horizon_shaders::with_options(&pack, &macros));
                     for note in &properties.notes {
                         log::warn!(
                             "shader pack {name}: shaders.properties:{}: {}",

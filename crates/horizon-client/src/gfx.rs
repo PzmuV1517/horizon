@@ -928,7 +928,8 @@ async fn open_device(
         // Mappable primary buffers: section pages that no longer fit in
         // video memory go to system memory. Shader packs' 16-bit normalized buffers (render
         // targets with the adapter's own format features) and R11F_G11F_B10F: a float
-        // stand-in neither clamps nor drops NaN.
+        // stand-in neither clamps nor drops NaN. Subgroups: shader packs' compute programs
+        // (`MC_GL_KHR_shader_subgroup_*`).
         let features = timing::GpuTimer::features(&adapter)
             | cull::Cull::features(&adapter)
             | (adapter.features()
@@ -936,7 +937,8 @@ async fn open_device(
                     | wgpu::Features::MAPPABLE_PRIMARY_BUFFERS
                     | wgpu::Features::TEXTURE_FORMAT_16BIT_NORM
                     | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES
-                    | wgpu::Features::RG11B10UFLOAT_RENDERABLE));
+                    | wgpu::Features::RG11B10UFLOAT_RENDERABLE
+                    | wgpu::Features::SUBGROUP));
         let driver = format!("{} {}", info.driver, info.driver_info);
         startup_step(format_args!(
             "requesting the device (driver {}) with features [{features}] and the adapter's \
@@ -3402,6 +3404,23 @@ impl Renderer {
             .unwrap_or_default()
     }
     /// The dimension the shader pack was last set for.
+    /// The macros of the GL extensions this device gives shader packs: subgroups, when it
+    /// has them.
+    pub fn define_pack_macros(&self, macros: &mut horizon_shaders::Macros) {
+        if self.device.features().contains(wgpu::Features::SUBGROUP) {
+            for ext in [
+                "basic",
+                "vote",
+                "arithmetic",
+                "ballot",
+                "shuffle",
+                "shuffle_relative",
+            ] {
+                macros.define(format!("MC_GL_KHR_shader_subgroup_{ext}"), "");
+            }
+        }
+    }
+
     pub fn shader_pack_dimension(&self) -> Option<i32> {
         self.pack_post.as_ref().map(|p| p.0)
     }
@@ -4525,7 +4544,18 @@ impl Renderer {
             cull.bind_depth(&self.device, world_depth);
         }
         let cull = self.cull.as_ref().filter(|_| culling && solid_draws > 0);
-        let clear = if frame.title || (frame.end_sky && !frame.underwater && sky_open(frame)) {
+        let pack_sky_clear = pack_draws_sky
+            .then(|| self.pack_post.as_ref().and_then(|p| p.1.as_ref()))
+            .flatten()
+            .and_then(|p| p.sky_clear());
+        let clear = if let Some([r, g, b, a]) = pack_sky_clear {
+            wgpu::Color {
+                r: f64::from(r),
+                g: f64::from(g),
+                b: f64::from(b),
+                a: f64::from(a),
+            }
+        } else if frame.title || (frame.end_sky && !frame.underwater && sky_open(frame)) {
             wgpu::Color::BLACK
         } else {
             wgpu::Color {

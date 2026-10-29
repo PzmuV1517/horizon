@@ -2222,7 +2222,7 @@ checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 [[package]]
 name = "naga"
 version = "30.0.1"
-source = "git+https://github.com/PzmuV1517/wgpu?rev=f219f9547989b747c47f9d079048071c7f827f28#f219f9547989b747c47f9d079048071c7f827f28"
+source = "git+https://github.com/PzmuV1517/wgpu?rev=c4a919da1d23c5b9ca5e7a0b8974d0e0c8fce4ba#c4a919da1d23c5b9ca5e7a0b8974d0e0c8fce4ba"
 dependencies = [
  "arrayvec",
  "bit-set",
@@ -2248,7 +2248,7 @@ dependencies = [
 [[package]]
 name = "naga-types"
 version = "30.0.1"
-source = "git+https://github.com/PzmuV1517/wgpu?rev=f219f9547989b747c47f9d079048071c7f827f28#f219f9547989b747c47f9d079048071c7f827f28"
+source = "git+https://github.com/PzmuV1517/wgpu?rev=c4a919da1d23c5b9ca5e7a0b8974d0e0c8fce4ba#c4a919da1d23c5b9ca5e7a0b8974d0e0c8fce4ba"
 dependencies = [
  "hashbrown 0.17.1",
  "indexmap",
