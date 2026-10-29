@@ -3343,8 +3343,24 @@ impl Renderer {
     /// What a shader pack's gbuffers programs read from Horizon's geometry: the sky's, and
     /// terrain's in the pack's block atlas (made here when missing; none when it does not fit).
     pub fn pack_inputs(&mut self) -> horizon_shaders::GameInputs {
+        let terrain = self.pack_terrain_inputs();
+        // A geometry stage reads flat draws' vertices itself, through their index buffer.
+        let terrain_geometry = terrain
+            .clone()
+            .filter(|_| self.pack_terrain_flat)
+            .map(|mut inputs| {
+                inputs.declarations.push_str(
+                    "layout(set = 5, binding = 0) readonly buffer HzIndices { uint hz_indices[]; };\n",
+                );
+                horizon_shaders::GeometryInputs {
+                    inputs,
+                    pull: pack_atlas::PULL.to_owned(),
+                    index: "hz_indices[@]".to_owned(),
+                }
+            });
         horizon_shaders::GameInputs {
-            terrain: self.pack_terrain_inputs(),
+            terrain,
+            terrain_geometry,
             sky: Some(pack_sky::inputs()),
             celestial: Some(pack_sky::celestial_inputs()),
             entities: Some(pack_entities::inputs()),
@@ -5005,7 +5021,8 @@ impl Renderer {
             let mut terrain =
                 |rp: &mut wgpu::RenderPass<'_>,
                  list: pack_post::TerrainList,
-                 page: &dyn Fn(&mut wgpu::RenderPass<'_>, u32)| {
+                 page: &dyn Fn(&mut wgpu::RenderPass<'_>, u32),
+                 geometry: Option<(u32, &wgpu::BindGroupLayout)>| {
                     use pack_post::TerrainList as L;
                     let shadow = matches!(list, L::ShadowSolid | L::ShadowTranslucent);
                     if !(if shadow {
@@ -5024,8 +5041,26 @@ impl Renderer {
                                 L::ShadowSolid => &flat.calls[shadow..shadow_translucent],
                                 L::ShadowTranslucent => &flat.calls[shadow_translucent..],
                             };
-                            flat.draw_with(rp, calls, |p| self.arena.buffer(p), page);
+                            match geometry {
+                                Some((instances, layout)) => {
+                                    let indices =
+                                        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                                            label: Some("Shader pack geometry indices"),
+                                            layout,
+                                            entries: &[wgpu::BindGroupEntry {
+                                                binding: 0,
+                                                resource: flat.indices.as_entire_binding(),
+                                            }],
+                                        });
+                                    rp.set_bind_group(5, &indices, &[]);
+                                    let vertices = |p| self.arena.buffer(p);
+                                    flat.draw_geometry(rp, calls, vertices, page, instances);
+                                }
+                                None => flat.draw_with(rp, calls, |p| self.arena.buffer(p), page),
+                            }
                         }
+                        // A geometry stage reads flat draws' indices; without them it draws nothing.
+                        None if geometry.is_some() => {}
                         None => {
                             rp.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
                             rp.set_vertex_buffer(1, self.instances.slice(..));

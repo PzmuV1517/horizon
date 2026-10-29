@@ -176,7 +176,20 @@ fn real_packs_read() {
                 entities: Some(terrain.clone()),
                 clouds: Some(terrain.clone()),
                 weather: Some(terrain.clone()),
-                hand: Some(terrain),
+                hand: Some(terrain.clone()),
+                terrain_geometry: Some(horizon_shaders::GeometryInputs {
+                    inputs: horizon_shaders::GbuffersInputs {
+                        declarations: format!(
+                            "layout(set = 3, binding = 1) readonly buffer HzVertices {{ uint hz_vertices[]; }};\n{}",
+                            terrain.declarations
+                        ),
+                        ..terrain
+                    },
+                    pull: "        hz_v_pos = uintBitsToFloat(uvec3(hz_vertices[hz_vertex_index * 6u], \
+                           hz_vertices[hz_vertex_index * 6u + 1u], hz_vertices[hz_vertex_index * 6u + 2u]));\n"
+                        .into(),
+                    index: "uint(@)".into(),
+                }),
             };
             let mut macros = Macros::standard();
             if std::env::var_os("SUBGROUPS").is_some() {
@@ -186,7 +199,7 @@ fn real_packs_read() {
                 println!("    {note}");
             }
             let post = load_post(&pack, &folder, &shaders, &macros, &inputs);
-            for p in &post.programs {
+            for p in post.programs.iter().chain(&post.shadow_comp) {
                 if std::env::var("PRINT_PROGRAM").is_ok_and(|n| n == p.name)
                     && let Some(program) = &p.program
                 {

@@ -257,14 +257,16 @@ impl Stage<'_> {
                 "gl_FragCoord" => Some("hz_FragCoord".into()),
                 "gl_FrontColor" => Some("hz_FrontColor".into()),
                 "gl_Fog" => Some("hz_Fog".into()),
+                // Before the compatibility inputs, of which `gl_Vertex` is a prefix.
+                "gl_VertexID" => Some("gl_VertexIndex".into()),
+                "gl_InstanceID" => Some("gl_InstanceIndex".into()),
+                "gl_VertexIndex" | "gl_InstanceIndex" => None,
                 _ if UNIFORM_STATE.iter().any(|b| t.starts_with(b)) => {
                     Some(format!("hz_{}", &t[3..]))
                 }
                 _ if !fragment && VERTEX_INPUTS.iter().any(|b| t.starts_with(b)) => {
                     Some(format!("hz_{}", &t[3..]))
                 }
-                "gl_VertexID" => Some("gl_VertexIndex".into()),
-                "gl_InstanceID" => Some("gl_InstanceIndex".into()),
                 _ if old && LATER_KEYWORDS.contains(&t) => Some(format!("hz_kw_{t}")),
                 _ => None,
             };

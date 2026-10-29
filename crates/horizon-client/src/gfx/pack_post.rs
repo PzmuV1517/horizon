@@ -205,6 +205,9 @@ fn image_buffers(images: &[(u32, Image)]) -> u16 {
         .fold(0, |m, b| m | 1 << b)
 }
 
+/// The format of the sink of passes that write only images.
+const SINK: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
+
 /// A pass's pipeline: a draw, or a compute dispatch.
 #[derive(Clone)]
 enum Pipeline {
@@ -259,6 +262,13 @@ struct Pass {
     copies: u16,
     /// Compute programs dispatched before this pass.
     compute: Vec<Pass>,
+    /// Writes no buffer, only images: draws into `Targets::sink`.
+    sink: bool,
+    /// Instances to draw for a geometry stage folded into the vertex stage; 0 without one.
+    geometry: u32,
+    /// The pack's images (bit n: `image.*` n) this pass samples and stores: sampled from the copy
+    /// taken at the frame's start.
+    image_copies: u16,
 }
 
 impl Pass {
@@ -292,6 +302,8 @@ struct Targets {
     scratch: [Option<wgpu::TextureView>; BUFFERS],
     /// Each buffer's size: the render size, or its `size.buffer`.
     sizes: [[u32; 2]; BUFFERS],
+    /// The attachment of passes that write only images.
+    sink: wgpu::TextureView,
 }
 
 /// What a pack's gbuffers programs read and draw from the game's world.
@@ -407,6 +419,9 @@ pub struct PackPost {
     dummy_3d: wgpu::TextureView,
     /// `image.*` and `bufferObject.*`.
     images: Vec<pack_images::PackImage>,
+    /// Set 5 of programs with a geometry stage.
+    indices: wgpu::BindGroupLayout,
+    dump: Option<pack_images::Dump>,
     buffers: pack_images::Buffers,
     textures: Vec<pack_textures::PackTexture>,
     /// The stand-in shadow map and its comparison sampler; cleared on the first frame.
@@ -737,8 +752,14 @@ impl TerrainList {
 
 /// Draws the game's terrain of one list into a pass; calls its third argument with each arena
 /// page before drawing from it.
-pub(super) type TerrainDraw<'a> =
-    dyn FnMut(&mut wgpu::RenderPass<'_>, TerrainList, &dyn Fn(&mut wgpu::RenderPass<'_>, u32)) + 'a;
+/// Draws a list's terrain: indexed, or for a program with a geometry stage, without indices and
+/// with that many instances (and its index buffer bound in set 5 by this layout).
+pub(super) type TerrainDraw<'a> = dyn FnMut(
+        &mut wgpu::RenderPass<'_>,
+        TerrainList,
+        &dyn Fn(&mut wgpu::RenderPass<'_>, u32),
+        Option<(u32, &wgpu::BindGroupLayout)>,
+    ) + 'a;
 
 /// What the shadow camera sees of the terrain, for the game's draw lists: its view and
 /// projection in wgpu's clip space, the direction toward the light, and how far from the camera
@@ -799,6 +820,8 @@ struct Resources<'a> {
     textures: &'a [pack_textures::PackTexture],
     images: &'a [pack_images::PackImage],
     buffers: &'a pack_images::Buffers,
+    /// Set 5 of a program with a geometry stage: the draw's indices.
+    indices: &'a wgpu::BindGroupLayout,
 }
 
 /// A program's bind group layout (its uniform block, samplers and images) and how each sampler
@@ -999,9 +1022,15 @@ fn bindings(
         } else {
             wgpu::TextureViewDimension::D2
         };
+        // Vertex stages write images too where the device lets them (a geometry stage).
+        let vertex = if features.contains(wgpu::Features::VERTEX_WRITABLE_STORAGE) {
+            wgpu::ShaderStages::VERTEX
+        } else {
+            wgpu::ShaderStages::NONE
+        };
         entries.push(wgpu::BindGroupLayoutEntry {
             binding: i.binding,
-            visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
+            visibility: vertex | wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
             ty: wgpu::BindingType::StorageTexture {
                 access,
                 format,
@@ -1126,7 +1155,15 @@ fn build_pass(
     while targets.last().is_some_and(Option::is_none) {
         targets.pop();
     }
-    if !final_pass && writes.is_empty() {
+    // A program that only writes images draws into a sink that keeps nothing.
+    let sink = !final_pass && writes.is_empty() && !program.interface.images.is_empty();
+    if sink && geometry.is_none() {
+        targets = vec![Some(wgpu::ColorTargetState {
+            format: SINK,
+            blend: None,
+            write_mask: wgpu::ColorWrites::empty(),
+        })];
+    } else if !final_pass && writes.is_empty() {
         notes.push(format!("{}: writes no buffer; skipped", p.name));
         return None;
     }
@@ -1155,6 +1192,7 @@ fn build_pass(
                 draw.then_some(draws),
                 geometry.and_then(|g| g.ids),
                 (!interface.buffers.is_empty()).then_some(&pack.buffers.layout),
+                (p.geometry_triangles > 0).then_some(pack.indices),
             ],
             ..Default::default()
         });
@@ -1173,12 +1211,17 @@ fn build_pass(
                 module: &vs,
                 entry_point: Some("main"),
                 compilation_options: Default::default(),
-                buffers: geometry.map_or(&[], |g| g.buffers),
+                // A geometry stage reads its vertices itself.
+                buffers: geometry
+                    .filter(|_| p.geometry_triangles == 0)
+                    .map_or(&[], |g| g.buffers),
             },
             // Rows flipped to GL's turn front faces clockwise.
             primitive: wgpu::PrimitiveState {
                 front_face: wgpu::FrontFace::Cw,
-                cull_mode: geometry.filter(|g| g.cull).map(|_| wgpu::Face::Back),
+                cull_mode: geometry
+                    .filter(|g| g.cull && p.geometry_triangles == 0)
+                    .map(|_| wgpu::Face::Back),
                 ..Default::default()
             },
             depth_stencil: geometry.map(|g| wgpu::DepthStencilState {
@@ -1217,6 +1260,7 @@ fn build_pass(
     if !missing.is_empty() {
         notes.push(format!("{}: zero for now: {}", p.name, missing.join(" ")));
     }
+    let image_copies = image_copies(&samplers, &images);
     Some(Pass {
         ubo: device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(&p.name),
@@ -1249,7 +1293,21 @@ fn build_pass(
         buffers: !interface.buffers.is_empty(),
         images,
         compute: Vec::new(),
+        sink,
+        geometry: p.geometry_triangles,
+        image_copies,
     })
+}
+
+/// The pack's images a pass both samples and stores.
+fn image_copies(samplers: &[Binding], images: &[(u32, Image)]) -> u16 {
+    samplers
+        .iter()
+        .filter_map(|s| match s.source {
+            Source::Image(k) if images.iter().any(|i| i.1 == Image::Custom(k)) => Some(k),
+            _ => None,
+        })
+        .fold(0, |m, k| m | 1 << k)
 }
 
 /// The pass of compute program `c` of a `group` program: `None` (with a note) when wgpu refuses
@@ -1326,6 +1384,7 @@ fn build_compute(
         }
     };
     let written = image_buffers(&images);
+    let image_copies = image_copies(&samplers, &images);
     Some(Pass {
         ubo: device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(&name),
@@ -1363,6 +1422,9 @@ fn build_compute(
         buffers: !interface.buffers.is_empty(),
         images,
         compute: Vec::new(),
+        sink: false,
+        geometry: 0,
+        image_copies,
     })
 }
 
@@ -1414,13 +1476,27 @@ impl PackPost {
                 .filter(|_| i < 2)
                 .map_or(formats[i], |f| f[i])
         });
-        let (mut storage, mut copied) = (0u16, 0u16);
+        let (mut storage, mut copied, mut image_copied) = (0u16, 0u16, 0u16);
         let images = pack_images::images(std::mem::take(&mut post.images));
         let buffers = pack_images::Buffers::new(device, std::mem::take(&mut post.buffer_objects));
+        let indices = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Shader pack geometry indices"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
         let pack = Resources {
             textures: &textures,
             images: &images,
             buffers: &buffers,
+            indices: &indices,
         };
         let mut build = |mut p: horizon_shaders::PostProgram, geometry: Option<&Geometry<'_>>| {
             let in_shadow = p.group.shadow();
@@ -1468,6 +1544,7 @@ impl PackPost {
                     used |= p.reads | p.written | p.flip;
                 }
                 storage |= image_buffers(&p.images);
+                image_copied |= p.image_copies;
                 copied |= p.copies;
             }
             Some(pass)
@@ -1907,8 +1984,16 @@ impl PackPost {
                 .cloned()
                 .unwrap_or_else(|| noise(device, queue)),
             dummy: texture(device, queue, "Shader pack stand-in", 1, &white),
-            images,
+            images: {
+                let mut images = images;
+                for (k, image) in images.iter_mut().enumerate() {
+                    image.copied = image_copied & 1 << k != 0;
+                }
+                images
+            },
             buffers,
+            indices,
+            dump: pack_images::Dump::new(),
             dummy_3d: device
                 .create_texture(&wgpu::TextureDescriptor {
                     label: Some("Shader pack 3D stand-in"),
@@ -2073,6 +2158,9 @@ impl PackPost {
                         &self.dummy_3d
                     }
                     Source::Dummy => &self.dummy,
+                    Source::Image(k) if pass.image_copies & 1 << k != 0 => {
+                        self.images[k].copy.as_ref().unwrap_or(&self.dummy)
+                    }
                     Source::Image(k) => self.images[k].view.as_ref().unwrap_or(&self.dummy),
                     Source::Custom { index, .. } => match &self.textures[index].image {
                         pack_textures::Image::View(v) => v,
@@ -2280,7 +2368,8 @@ impl PackPost {
                     rp.set_bind_group(3, group, &[]);
                 }
             };
-            draw(&mut rp, list, &page);
+            let geometry = (pass.geometry > 0).then_some((pass.geometry, &self.indices));
+            draw(&mut rp, list, &page, geometry);
         }
         if !pass.group.shadow() {
             self.mips_valid &= !pass.written;
@@ -2857,8 +2946,15 @@ impl PackPost {
                 .create_view(&Default::default())
             })
         });
+        let sink = texture(
+            "Shader pack sink",
+            SINK,
+            wgpu::TextureUsages::RENDER_ATTACHMENT,
+        )
+        .create_view(&Default::default());
         self.targets = Some(Targets {
             size,
+            sink,
             sizes,
             scratch,
             color,
@@ -3007,6 +3103,14 @@ impl PackPost {
         if self.targets.is_none() {
             return;
         }
+        // Images start the frame cleared, before the shadow pass writes them; a pass that also
+        // samples one it writes samples the copy of last frame's, taken first.
+        if let Some(dump) = &mut self.dump {
+            dump.read(device);
+            dump.copy(device, encoder, &self.images);
+        }
+        pack_images::copy(encoder, &self.images);
+        pack_images::clear(encoder, &self.images);
         self.run_shadow(device, queue, encoder, terrain);
         let Some(targets) = &self.targets else { return };
         let main = |m: u16, i: usize| usize::from(m & 1 << i != 0);
@@ -3069,8 +3173,6 @@ impl PackPost {
                 ..Default::default()
             });
         }
-
-        pack_images::clear(encoder, &self.images);
 
         // The world into colortex0 and depthtex0, flipped to GL's rows, and the clears.
         if self.blit_group.as_ref().is_none_or(|g| g.0 != size) {
@@ -3188,6 +3290,8 @@ impl PackPost {
             if final_pass {
                 attachments.push(attach(screen, overwrite));
                 shown = true;
+            } else if pass.sink {
+                attachments.push(attach(&targets.sink, overwrite));
             } else {
                 for &(location, buffer) in &pass.writes {
                     let l = location as usize;

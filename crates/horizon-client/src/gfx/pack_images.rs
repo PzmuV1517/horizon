@@ -11,6 +11,9 @@ pub(super) struct PackImage {
     pub(super) format: wgpu::TextureFormat,
     pub(super) dimension: wgpu::TextureViewDimension,
     pub(super) view: Option<wgpu::TextureView>,
+    /// Last frame's contents, for a pass that samples and stores the image (`copied`).
+    pub(super) copy: Option<wgpu::TextureView>,
+    pub(super) copied: bool,
     /// The render size the image was made for (relative images follow it).
     made_for: [u32; 2],
 }
@@ -35,6 +38,8 @@ pub(super) fn images(defs: Vec<CustomImage>) -> Vec<PackImage> {
             },
             def,
             view: None,
+            copy: None,
+            copied: false,
             made_for: [0; 2],
         })
         .collect()
@@ -71,28 +76,60 @@ pub(super) fn resize_images(device: &wgpu::Device, images: &mut [PackImage], siz
             continue;
         }
         let [width, height, depth] = image.def.extent(size);
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some(&image.def.name),
-            size: wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: depth,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: if image.dimension == wgpu::TextureViewDimension::D3 {
-                wgpu::TextureDimension::D3
-            } else {
-                wgpu::TextureDimension::D2
-            },
-            format: image.format,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::STORAGE_BINDING
-                | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        image.view = Some(texture.create_view(&Default::default()));
+        let make = |usage| {
+            device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some(&image.def.name),
+                    size: wgpu::Extent3d {
+                        width,
+                        height,
+                        depth_or_array_layers: depth,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: if image.dimension == wgpu::TextureViewDimension::D3 {
+                        wgpu::TextureDimension::D3
+                    } else {
+                        wgpu::TextureDimension::D2
+                    },
+                    format: image.format,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | usage,
+                    view_formats: &[],
+                })
+                .create_view(&Default::default())
+        };
+        // Atomics on a texture need it made for them (Metal ignores them otherwise).
+        let atomic = device.features().contains(wgpu::Features::TEXTURE_ATOMIC)
+            && matches!(
+                image.format,
+                wgpu::TextureFormat::R32Sint | wgpu::TextureFormat::R32Uint
+            );
+        let atomic = if atomic {
+            wgpu::TextureUsages::STORAGE_ATOMIC
+        } else {
+            wgpu::TextureUsages::empty()
+        };
+        image.view = Some(make(
+            wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::COPY_SRC
+                | atomic,
+        ));
+        image.copy = image.copied.then(|| make(wgpu::TextureUsages::COPY_DST));
         image.made_for = size;
+    }
+}
+
+/// Copies the images a pass samples and stores, for that pass to sample.
+pub(super) fn copy(encoder: &mut wgpu::CommandEncoder, images: &[PackImage]) {
+    for image in images {
+        if let (Some(view), Some(copy)) = (&image.view, &image.copy) {
+            encoder.copy_texture_to_texture(
+                view.texture().as_image_copy(),
+                copy.texture().as_image_copy(),
+                view.texture().size(),
+            );
+        }
     }
 }
 
@@ -186,5 +223,96 @@ impl Buffers {
     /// Whether the pack declares buffer `binding`.
     pub(super) fn has(&self, binding: u32) -> bool {
         self.objects.contains_key(&binding)
+    }
+}
+
+/// A debug readback of one of the pack's images (`HORIZON_SHADER_PACK_DUMP=<name>`): every 60
+/// frames, how many of its texels are not zero, logged.
+pub(super) struct Dump {
+    name: String,
+    frame: u32,
+    pending: Option<(wgpu::Buffer, usize, [u32; 3], u32)>,
+}
+
+impl Dump {
+    pub(super) fn new() -> Option<Self> {
+        let name = std::env::var("HORIZON_SHADER_PACK_DUMP").ok()?;
+        Some(Self {
+            name,
+            frame: 0,
+            pending: None,
+        })
+    }
+
+    /// Reads last frame's copy, once its commands ran.
+    pub(super) fn read(&mut self, device: &wgpu::Device) {
+        let Some((buffer, texel, [w, h, d], row)) = self.pending.take() else {
+            return;
+        };
+        buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        let _ = device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
+        let Ok(data) = buffer.slice(..).get_mapped_range() else {
+            return;
+        };
+        let (mut set, mut total) = (0usize, 0usize);
+        for z in 0..d as usize {
+            for y in 0..h as usize {
+                let start = (z * h as usize + y) * row as usize;
+                for x in 0..w as usize {
+                    let at = start + x * texel;
+                    total += 1;
+                    if data[at..at + texel].iter().any(|&b| b != 0) {
+                        set += 1;
+                    }
+                }
+            }
+        }
+        log::info!(
+            "shader pack image {}: {set} of {total} texels set",
+            self.name
+        );
+    }
+
+    /// Copies the image for `read` every 60 frames.
+    pub(super) fn copy(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        images: &[PackImage],
+    ) {
+        self.frame += 1;
+        if !self.frame.is_multiple_of(60) {
+            return;
+        }
+        let Some(image) = images.iter().find(|i| i.def.name == self.name) else {
+            return;
+        };
+        let Some(view) = &image.view else { return };
+        let size = view.texture().size();
+        let texel = image.format.block_copy_size(None).unwrap_or(4) as usize;
+        let row = (size.width as usize * texel).next_multiple_of(256) as u32;
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Shader pack image dump"),
+            size: u64::from(row) * u64::from(size.height) * u64::from(size.depth_or_array_layers),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            view.texture().as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row),
+                    rows_per_image: Some(size.height),
+                },
+            },
+            size,
+        );
+        let dims = [size.width, size.height, size.depth_or_array_layers];
+        self.pending = Some((buffer, texel, dims, row));
     }
 }

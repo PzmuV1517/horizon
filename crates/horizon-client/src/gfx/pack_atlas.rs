@@ -115,6 +115,16 @@ impl PackAtlas {
 
 /// GLSL: the face normal and tangent of a flat-drawn vertex, from its quad's first three corners
 /// (quads are four consecutive vertices of the page; position words 0-2, UV word 3).
+/// A `TerrainVertex` of flat draws' arena page (`hz_vertices`, six words each) into the vertex
+/// inputs, for vertex `hz_vertex_index`.
+pub const PULL: &str = "        uint hz_pw = hz_vertex_index * 6u;\n        \
+    hz_v_pos = uintBitsToFloat(uvec3(hz_vertices[hz_pw], hz_vertices[hz_pw + 1u], hz_vertices[hz_pw + 2u]));\n        \
+    hz_v_uv = uvec2(hz_vertices[hz_pw + 3u] & 65535u, hz_vertices[hz_pw + 3u] >> 16u);\n        \
+    hz_v_layer = hz_vertices[hz_pw + 4u] & 65535u;\n        \
+    uint hz_pl = hz_vertices[hz_pw + 4u] >> 16u;\n        \
+    hz_v_light = uvec2(hz_pl & 255u, hz_pl >> 8u);\n        \
+    hz_v_color = unpackUnorm4x8(hz_vertices[hz_pw + 5u]);\n";
+
 const FACE: &str = "    uint hz_q = (uint(gl_VertexIndex) & ~3u) * 6u;\n    \
     vec3 hz_p0 = uintBitsToFloat(uvec3(hz_vertices[hz_q], hz_vertices[hz_q + 1u], hz_vertices[hz_q + 2u]));\n    \
     vec3 hz_p1 = uintBitsToFloat(uvec3(hz_vertices[hz_q + 6u], hz_vertices[hz_q + 7u], hz_vertices[hz_q + 8u]));\n    \

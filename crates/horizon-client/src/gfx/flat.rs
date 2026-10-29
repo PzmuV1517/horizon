@@ -698,6 +698,23 @@ impl Flat {
             pass.draw_indexed(call.first..call.first + call.count, 0, 0..1);
         }
     }
+    /// Draws `calls` without their index buffer, `instances` times: a shader pack's geometry
+    /// stage reads the indices itself (`hz_indices`) and stands for one emitted triangle per
+    /// instance.
+    pub fn draw_geometry<'a>(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        calls: &[Call],
+        vertices: impl Fn(u32) -> &'a wgpu::Buffer,
+        page: impl Fn(&mut wgpu::RenderPass<'_>, u32),
+        instances: u32,
+    ) {
+        for call in calls {
+            self.bind_page(pass, call.page, &vertices);
+            page(pass, call.page);
+            pass.draw(call.first..call.first + call.count, 0..instances);
+        }
+    }
     /// Draws phase 2's calls, as `flatten_phase2` left them.
     pub fn draw_phase2<'a>(
         &self,

@@ -49,7 +49,7 @@ pub use textures::{
     CustomTexture, Dim as TextureDim, Texels, Texture, TextureSource, decode_png, load_textures,
 };
 pub use translate::{
-    AlphaTest, ComputeProgram, DRAW_UNIFORMS, Error, GbuffersInputs, Image, Interface, Program,
-    Sampler, Target, Uniform, translate_composite, translate_compute, translate_gbuffers,
-    translate_shadow,
+    AlphaTest, ComputeProgram, DRAW_UNIFORMS, Error, GbuffersInputs, GeometryInputs, Image,
+    Interface, Program, Sampler, Target, Uniform, translate_composite, translate_compute,
+    translate_gbuffers, translate_geometry, translate_shadow,
 };
