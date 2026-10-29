@@ -186,15 +186,29 @@ impl Entities {
 enum Image {
     Color(usize),
     Custom(usize),
+    /// The copy of a buffer or a pack image taken before a dispatch, which its loads read.
+    ColorBefore(usize),
+    CustomBefore(usize),
 }
 
 impl Image {
     fn buffer(self) -> Option<usize> {
         match self {
             Image::Color(b) => Some(b),
-            Image::Custom(_) => None,
+            _ => None,
         }
     }
+}
+
+/// The buffers and the pack images (masks) `images` read as copies taken before a dispatch.
+fn befores(images: &[(u32, Image)]) -> (u16, u16) {
+    images
+        .iter()
+        .fold((0, 0), |(colors, customs), i| match i.1 {
+            Image::ColorBefore(b) => (colors | 1 << b, customs),
+            Image::CustomBefore(k) => (colors, customs | 1 << k),
+            _ => (colors, customs),
+        })
 }
 
 /// The color buffers of `images`, as a mask.
@@ -269,6 +283,8 @@ struct Pass {
     /// The pack's images (bit n: `image.*` n) this pass samples and stores: sampled from the copy
     /// taken at the frame's start.
     image_copies: u16,
+    /// The pack's images a compute pass's loads read as they were before it: copied first.
+    snapshots: u16,
 }
 
 impl Pass {
@@ -999,6 +1015,22 @@ fn bindings(
         let (target, actual) = match (buffer, own) {
             (_, Some(k)) => (Image::Custom(k), pack.images[k].format),
             (Some(b), None) => (Image::Color(b), formats[b]),
+            (None, None) if i.before.is_some() => {
+                // Bound as the image it copies.
+                let of = i.before.as_deref().unwrap_or_default();
+                let buffer = of
+                    .strip_prefix("colorimg")
+                    .and_then(|n| n.parse::<usize>().ok())
+                    .filter(|&n| n < BUFFERS && !group.shadow());
+                match (buffer, pack.images.iter().position(|c| c.def.name == of)) {
+                    (_, Some(k)) => (Image::CustomBefore(k), pack.images[k].format),
+                    (Some(b), None) => (Image::ColorBefore(b), formats[b]),
+                    (None, None) => {
+                        notes.push(format!("{name}: image `{of}` is not provided yet"));
+                        return None;
+                    }
+                }
+            }
             (None, None) => {
                 notes.push(format!("{name}: image `{}` is not provided yet", i.name));
                 return None;
@@ -1300,6 +1332,7 @@ fn build_pass(
         sink,
         geometry: p.geometry_triangles,
         image_copies,
+        snapshots: 0,
     })
 }
 
@@ -1389,6 +1422,7 @@ fn build_compute(
     };
     let written = image_buffers(&images);
     let image_copies = image_copies(&samplers, &images);
+    let (before_colors, snapshots) = befores(&images);
     Some(Pass {
         ubo: device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(&name),
@@ -1414,7 +1448,7 @@ fn build_compute(
         samplers,
         writes: Vec::new(),
         flip: 0,
-        copies: written & reads,
+        copies: written & reads | before_colors,
         reads: reads | written,
         shadow_reads,
         written,
@@ -1429,6 +1463,7 @@ fn build_compute(
         sink: false,
         geometry: 0,
         image_copies,
+        snapshots,
     })
 }
 
@@ -1548,7 +1583,7 @@ impl PackPost {
                     used |= p.reads | p.written | p.flip;
                 }
                 storage |= image_buffers(&p.images);
-                image_copied |= p.image_copies;
+                image_copied |= p.image_copies | p.snapshots;
                 copied |= p.copies;
             }
             Some(pass)
@@ -2205,6 +2240,8 @@ impl PackPost {
                         targets.color[i].as_ref().map_or(&self.dummy, |t| &t[side])
                     }
                     Image::Custom(k) => self.images[k].view.as_ref().unwrap_or(&self.dummy),
+                    Image::ColorBefore(i) => targets.scratch[i].as_ref().unwrap_or(&self.dummy),
+                    Image::CustomBefore(k) => self.images[k].copy.as_ref().unwrap_or(&self.dummy),
                 };
                 entries.push(wgpu::BindGroupEntry {
                     binding,
@@ -2253,6 +2290,9 @@ impl PackPost {
                     t[side].texture().size(),
                 );
             }
+        }
+        for image in (0..self.images.len()).filter(|k| pass.snapshots & 1 << k != 0) {
+            pack_images::copy(encoder, &self.images[image..=image]);
         }
         let group = self.bind(device, queue, pass, size);
         let mut cp = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -2955,10 +2995,16 @@ impl PackPost {
         });
         let scratch = std::array::from_fn(|i| {
             (self.copied & 1 << i != 0).then(|| {
+                // A copy also read as an image before a dispatch.
+                let image = if self.storage & 1 << i != 0 {
+                    wgpu::TextureUsages::STORAGE_BINDING
+                } else {
+                    wgpu::TextureUsages::empty()
+                };
                 texture_sized(
                     &format!("colortex{i} copy"),
                     self.formats[i],
-                    wgpu::TextureUsages::COPY_DST,
+                    wgpu::TextureUsages::COPY_DST | image,
                     1,
                     sizes[i],
                 )

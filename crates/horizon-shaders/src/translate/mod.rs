@@ -29,6 +29,7 @@ use crate::Preprocessed;
 
 mod atomic_vectors;
 mod geometry;
+mod ordering;
 mod rewrite;
 mod scan;
 
@@ -68,6 +69,9 @@ pub struct Image {
     /// uses.
     pub access: String,
     pub binding: u32,
+    /// A compute program's copy of image `before` as it was before the dispatch, which its
+    /// loads read (see `ordering`).
+    pub before: Option<String>,
 }
 
 /// A compute program (`deferred4_a.csh`): its module, what it reads and writes, and how many
@@ -564,6 +568,7 @@ fn bind_images(stages: [&Stage; 2], samplers: usize) -> Vec<Image> {
             format: i.format,
             access: i.access,
             binding: 1 + 2 * samplers as u32 + k as u32,
+            before: None,
         })
         .collect()
 }
@@ -631,7 +636,28 @@ pub fn translate_compute(compute: &Preprocessed) -> Result<ComputeProgram, Vec<E
             binding: 1 + 2 * i as u32,
         })
         .collect();
-    let images = bind_images([&c, &c], samplers.len());
+    let mut images = bind_images([&c, &c], samplers.len());
+    let code = c.rewrite(&samplers, &uniforms);
+    let code = ordering::barriers_after_atomics(&code).unwrap_or(code);
+    let declared: Vec<(String, bool)> = c
+        .images
+        .iter()
+        .map(|i| (i.name.clone(), i.coherent))
+        .collect();
+    let before = ordering::snapshots(&code, &declared);
+    let code = ordering::read_before(&code, &before);
+    for name in before {
+        let image = images.iter().find(|i| i.name == name).expect("declared");
+        let copy = Image {
+            name: ordering::before_name(&name),
+            ty: image.ty.clone(),
+            format: image.format.clone(),
+            access: String::new(),
+            binding: 1 + 2 * samplers.len() as u32 + images.len() as u32,
+            before: Some(name),
+        };
+        images.push(copy);
+    }
     let mut main = String::from("\nvoid main() {\n");
     main.push_str(
         "    hz_Fog = hz_FogParameters(hz_fog_color, hz_fog.x, hz_fog.y, hz_fog.z, hz_fog.w);\n",
@@ -641,7 +667,7 @@ pub fn translate_compute(compute: &Preprocessed) -> Result<ComputeProgram, Vec<E
     }
     main.push_str("    hz_main();\n}\n");
     let header = resources(&uniforms, &samplers, &images) + &c.prelude();
-    let text = format!("{header}{}{main}", c.rewrite(&samplers, &uniforms));
+    let text = format!("{header}{code}{main}");
     if !errors.is_empty() {
         return Err(errors);
     }

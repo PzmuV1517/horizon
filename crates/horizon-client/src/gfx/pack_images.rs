@@ -115,7 +115,9 @@ pub(super) fn resize_images(device: &wgpu::Device, images: &mut [PackImage], siz
                 | wgpu::TextureUsages::COPY_SRC
                 | atomic,
         ));
-        image.copy = image.copied.then(|| make(wgpu::TextureUsages::COPY_DST));
+        image.copy = image
+            .copied
+            .then(|| make(wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::STORAGE_BINDING));
         image.made_for = size;
     }
 }
