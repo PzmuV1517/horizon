@@ -4,7 +4,12 @@
 use std::collections::BTreeMap;
 
 /// The Iris feature flags (`iris.features.*`) Horizon has.
-const FEATURES: [&str; 2] = ["COMPUTE_SHADERS", "ENTITY_TRANSLUCENT"];
+const FEATURES: [&str; 4] = [
+    "COMPUTE_SHADERS",
+    "CUSTOM_IMAGES",
+    "ENTITY_TRANSLUCENT",
+    "SSBO",
+];
 
 /// `MC_VERSION` of the version Horizon plays: 26.3 → 260300.
 pub const MC_VERSION: u32 = mc_version(horizon_core::version::VERSION_ID);

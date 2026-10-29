@@ -187,6 +187,20 @@ fn real_packs_read() {
             }
             let post = load_post(&pack, &folder, &shaders, &macros, &inputs);
             for p in &post.programs {
+                if std::env::var("PRINT_PROGRAM").is_ok_and(|n| n == p.name) {
+                    for s in &p.program.interface.samplers {
+                        println!(
+                            "    {} sampler {} {} at {}",
+                            p.name, s.ty, s.name, s.binding
+                        );
+                    }
+                    for i in &p.program.interface.images {
+                        println!(
+                            "    {} image {} {} {} at {}",
+                            p.name, i.ty, i.name, i.format, i.binding
+                        );
+                    }
+                }
                 for (name, c) in &p.compute {
                     println!(
                         "    {name} before {}: {} images, groups {:?} / {:?}, local {:?}",

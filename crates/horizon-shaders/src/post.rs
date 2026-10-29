@@ -247,6 +247,98 @@ impl BufferSize {
     }
 }
 
+/// `bufferObject.<n>`: an SSBO's size in bytes, or bytes per pixel of the render size scaled.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum BufferObject {
+    Bytes(u64),
+    PerPixel { bytes: u64, scale: [f32; 2] },
+}
+
+impl BufferObject {
+    fn parse(value: &str) -> Option<Self> {
+        let words: Vec<&str> = value.split_whitespace().collect();
+        let bytes = words.first()?.parse().ok()?;
+        match words[..] {
+            [_] | [_, "false", ..] => Some(Self::Bytes(bytes)),
+            [_, "true", x, y] => Some(Self::PerPixel {
+                bytes,
+                scale: [x.parse().ok()?, y.parse().ok()?],
+            }),
+            _ => None,
+        }
+    }
+
+    /// The size in bytes for a render size of `render`, at least 16.
+    pub fn size(self, render: [u32; 2]) -> u64 {
+        match self {
+            Self::Bytes(b) => b,
+            Self::PerPixel { bytes, scale } => {
+                let [w, h] = [0, 1].map(|k| (render[k] as f32 * scale[k]) as u64);
+                bytes * w * h
+            }
+        }
+        .max(16)
+    }
+}
+
+/// `image.<name>`: an image of the pack's, read and written as `name`, sampled as `sampler`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CustomImage {
+    pub name: String,
+    pub sampler: Option<String>,
+    pub format: crate::Format,
+    /// Relative to the render size (width and height), or in pixels with a depth for 3D.
+    pub size: ImageSize,
+    /// Cleared to zero before each frame.
+    pub clear: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ImageSize {
+    Relative([f32; 2]),
+    Absolute([u32; 3]),
+}
+
+impl CustomImage {
+    fn parse(name: &str, value: &str) -> Option<Self> {
+        let w: Vec<&str> = value.split_whitespace().collect();
+        let [sampler, _format, internal, _ty, clear, relative, rest @ ..] = &w[..] else {
+            return None;
+        };
+        let size = match (*relative, rest) {
+            ("true", [x, y, ..]) => ImageSize::Relative([x.parse().ok()?, y.parse().ok()?]),
+            ("false", [x, y]) => ImageSize::Absolute([x.parse().ok()?, y.parse().ok()?, 1]),
+            ("false", [x, y, z]) => {
+                ImageSize::Absolute([x.parse().ok()?, y.parse().ok()?, z.parse().ok()?])
+            }
+            _ => return None,
+        };
+        Some(Self {
+            name: name.to_owned(),
+            sampler: (*sampler != "none").then(|| sampler.to_string()),
+            format: crate::Format::parse(internal)?,
+            size,
+            clear: *clear == "true",
+        })
+    }
+
+    /// Width, height and depth for a render size of `render`.
+    pub fn extent(&self, render: [u32; 2]) -> [u32; 3] {
+        match self.size {
+            ImageSize::Relative(s) => {
+                let [w, h] = [0, 1].map(|k| ((render[k] as f32 * s[k]) as u32).max(1));
+                [w, h, 1]
+            }
+            ImageSize::Absolute(s) => s.map(|n| n.max(1)),
+        }
+    }
+
+    /// A 3D image (`image3D`), not a 2D one.
+    pub fn is_3d(&self) -> bool {
+        matches!(self.size, ImageSize::Absolute([_, _, z]) if z > 1)
+    }
+}
+
 pub struct Post {
     /// The folder the programs came from: `""` for `shaders` itself, else `world0`...
     pub folder: String,
@@ -303,6 +395,10 @@ pub struct Post {
     pub textures: Vec<crate::CustomTexture>,
     /// `size.buffer.*`, by buffer.
     pub sizes: [Option<BufferSize>; crate::BUFFERS],
+    /// `bufferObject.*`, by binding.
+    pub buffer_objects: std::collections::BTreeMap<u32, BufferObject>,
+    /// `image.*`.
+    pub images: Vec<CustomImage>,
     pub config: Config,
     /// Programs skipped and why, as `program: message` or `file:line: message`.
     pub notes: Vec<String>,
@@ -374,10 +470,26 @@ pub fn load_post(
         custom: Custom::parse(properties),
         textures: Vec::new(),
         sizes: [None; crate::BUFFERS],
+        buffer_objects: Default::default(),
+        images: Vec::new(),
         config: Config::default(),
         notes: Vec::new(),
     };
     for e in &properties.entries {
+        if let Some(n) = e.key.strip_prefix("bufferObject.") {
+            match (n.parse(), BufferObject::parse(&e.value)) {
+                (Ok(n), Some(b)) => _ = post.buffer_objects.insert(n, b),
+                _ => post.notes.push(format!("`{}`: not a buffer object", e.key)),
+            }
+            continue;
+        }
+        if let Some(name) = e.key.strip_prefix("image.") {
+            match CustomImage::parse(name, &e.value) {
+                Some(i) => post.images.push(i),
+                None => post.notes.push(format!("`{}`: not an image", e.key)),
+            }
+            continue;
+        }
         let Some(name) = e.key.strip_prefix("size.buffer.") else {
             continue;
         };

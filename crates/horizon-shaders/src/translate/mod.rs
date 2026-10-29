@@ -49,6 +49,8 @@ pub struct Interface {
     pub draw: bool,
     /// Storage images (`colorimg4`...), after the samplers.
     pub images: Vec<Image>,
+    /// The SSBOs' bindings in set 4 (`bufferObject.<n>`).
+    pub buffers: Vec<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -58,7 +60,8 @@ pub struct Image {
     pub ty: String,
     /// The format qualifier (`rgba16f`).
     pub format: String,
-    /// `readonly`, `writeonly`, or empty for both.
+    /// `readonly`, `writeonly`, empty for both, or `atomic` for an image an atomic function
+    /// uses.
     pub access: String,
     pub binding: u32,
 }
@@ -503,9 +506,10 @@ fn translate(
         })
         .collect();
     let outputs = f.outputs.iter().copied().collect();
+    let mut images = images;
+    mark_atomic(&vertex, &mut images);
+    mark_atomic(&fragment, &mut images);
     Ok(Program {
-        vertex,
-        fragment,
         interface: Interface {
             uniform_size,
             uniforms,
@@ -513,8 +517,30 @@ fn translate(
             outputs,
             draw,
             images,
+            buffers: v.buffers.union(&f.buffers).copied().collect(),
         },
+        vertex,
+        fragment,
     })
+}
+
+/// Images an atomic function uses (naga gave them atomic access) are bound for atomics.
+fn mark_atomic(module: &naga::Module, images: &mut [Image]) {
+    for (_, g) in module.global_variables.iter() {
+        let naga::TypeInner::Image {
+            class: naga::ImageClass::Storage { access, .. },
+            ..
+        } = module.types[g.ty].inner
+        else {
+            continue;
+        };
+        if let Some(b) = &g.binding
+            && access.contains(naga::StorageAccess::ATOMIC)
+            && let Some(i) = images.iter_mut().find(|i| i.binding == b.binding)
+        {
+            i.access = "atomic".into();
+        }
+    }
 }
 
 /// The images of `stages`, by name, bound after `samplers` samplers.
@@ -618,7 +644,7 @@ pub fn translate_compute(compute: &Preprocessed) -> Result<ComputeProgram, Vec<E
         std::mem::take(&mut errors)
     })?;
     let (uniform_size, offsets) = block_layout(&module);
-    let interface = Interface {
+    let mut interface = Interface {
         uniform_size,
         uniforms: offsets
             .into_iter()
@@ -639,7 +665,9 @@ pub fn translate_compute(compute: &Preprocessed) -> Result<ComputeProgram, Vec<E
         outputs: Vec::new(),
         draw: false,
         images,
+        buffers: c.buffers.iter().copied().collect(),
     };
+    mark_atomic(&module, &mut interface.images);
     Ok(ComputeProgram {
         module,
         interface,

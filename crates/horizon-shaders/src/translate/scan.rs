@@ -40,6 +40,8 @@ pub(super) struct Stage<'p> {
     pub(super) uniforms: Vec<(String, String, usize)>,
     pub(super) samplers: Vec<(String, String)>,
     pub(super) images: Vec<ImageDecl>,
+    /// The bindings of the SSBOs (`buffer` blocks), in set 4.
+    pub(super) buffers: BTreeSet<u32>,
     pub(super) ins: Vec<Var>,
     pub(super) outs: Vec<Var>,
     /// Vertex inputs, now private globals, and the value our `main` gives each.
@@ -214,6 +216,7 @@ impl<'p> Stage<'p> {
             uniforms: Vec::new(),
             samplers: Vec::new(),
             images: Vec::new(),
+            buffers: BTreeSet::new(),
             ins: Vec::new(),
             outs: Vec::new(),
             attributes: Vec::new(),
@@ -354,6 +357,9 @@ impl<'p> Stage<'p> {
             .position(|&i| matches!(self.tokens[i], "(" | "="));
         let prototype = paren.is_some_and(|p| self.tokens[words[p]] == "(")
             && !words.iter().any(|&i| STORAGE.contains(&self.tokens[i]));
+        if body && words.iter().any(|&i| self.tokens[i] == "buffer") {
+            return self.buffer_block(&words);
+        }
         if body || prototype {
             return self.function(&words);
         }
@@ -627,6 +633,34 @@ impl<'p> Stage<'p> {
         }
         self.replaced.extend(replaced);
         self.inits.extend(names);
+    }
+
+    /// `layout(std430, binding = n) buffer Name {`: an SSBO, in set 4 at its binding. Its
+    /// access qualifiers go, so that every stage binds it alike (read and write).
+    fn buffer_block(&mut self, words: &[usize]) {
+        let mut binding = None;
+        for (k, &i) in words.iter().enumerate() {
+            match self.tokens[i] {
+                "binding" => {
+                    binding = words
+                        .get(k + 2)
+                        .and_then(|&n| self.tokens[n].parse::<u32>().ok());
+                    self.replaced.insert(i, "set = 4, binding".into());
+                }
+                "readonly" | "writeonly" | "restrict" | "coherent" | "volatile" => {
+                    self.removed.push(i..i + 1)
+                }
+                _ => {}
+            }
+        }
+        match binding {
+            Some(b) => _ = self.buffers.insert(b),
+            None => {
+                let at = words.first().copied().unwrap_or(0);
+                self.errors
+                    .push(self.error(at, "a buffer block needs a binding"));
+            }
+        }
     }
 
     /// `struct Name {` at token `open`, whose words start at `from`: its members, to `}`.
