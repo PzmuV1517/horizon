@@ -6,8 +6,8 @@
 //! `pull`), runs the pack's vertex stage on each, then the geometry stage, keeping the corner it
 //! stands for; a corner the stage does not emit is degenerate.
 //!
-//! The geometry stage runs once per output corner, so what it writes to images and buffers is
-//! written that many times per triangle.
+//! The geometry stage runs once per output corner; the image and buffer writes it makes as
+//! statements run in one of them only (`hz_primary`).
 
 use std::collections::BTreeSet;
 use std::fmt::Write;
@@ -353,10 +353,13 @@ fn combine(
         }
     }
 
+    once(&mut gs_text, &gs_tokens);
+    once(&mut vs_text, &vs_tokens);
+
     // Ours: before the geometry stage, its emission; after the vertex stage, `main`.
     let mut head = String::from(
         "void hz_emit(); void hz_end(); struct hz_PerVertex { vec4 p; }; hz_PerVertex hz_gl_in[3];\n\
-         int hz_n; int hz_strip; int hz_tri; int hz_want_tri; int hz_want_corner; bool hz_found;\n\
+         int hz_n; int hz_strip; int hz_tri; int hz_want_tri; int hz_want_corner; bool hz_found; bool hz_primary;\n\
          vec4 hz_ring_Position[3]; vec4 hz_res_Position; vec4 hz_vs_Position; int hz_vs_vertex;\n",
     );
     for (name, ty) in &vs_outs {
@@ -395,6 +398,7 @@ fn combine(
     let mut main = String::from(
         "void main() {\n    uint hz_v = uint(gl_VertexIndex);\n    uint hz_first = hz_v / 3u * 3u;\n    \
          hz_want_corner = int(hz_v % 3u);\n    hz_want_tri = int(gl_InstanceIndex);\n    \
+         hz_primary = hz_want_tri == 0 && hz_want_corner == 0;\n    \
          for (int hz_i = 0; hz_i < 3; hz_i++) {\n",
     );
     writeln!(
@@ -455,8 +459,66 @@ fn combine(
     ours(&mut code, &mut out.lines, &main);
     out.code = code.trim_end_matches('\n').to_owned();
     out.lines.truncate(out.code.split('\n').count());
-    let triangles = max_vertices.saturating_sub(2).max(1);
+    // A strip of n vertices is n - 2 triangles; each `EndPrimitive` ends a strip, which took at
+    // least three of the vertices.
+    let strips = gs_tokens.iter().filter(|t| **t == "EndPrimitive").count() as u32;
+    let triangles = max_vertices
+        .saturating_sub(2 * strips.min(max_vertices / 3).max(1))
+        .max(1);
     Ok((out, triangles))
+}
+
+/// Functions whose calls write memory other invocations see.
+fn writes(name: &str) -> bool {
+    name == "imageStore" || name.starts_with("imageAtomic") || name.starts_with("atomic")
+}
+
+/// Calls that write images or buffers run for one invocation of a triangle only: as statements,
+/// `if (hz_primary) imageStore(...)`; in an expression the others read the value instead,
+/// `(hz_primary ? imageAtomicOr(i, p, v) : imageLoad(i, p).x)`, `(hz_primary ? atomicAdd(m, v) : m)`.
+fn once(text: &mut [String], tokens: &[&str]) {
+    for (i, &t) in tokens.iter().enumerate() {
+        let open = (i + 1..tokens.len()).find(|&j| significant(tokens[j]));
+        let Some(open) = open.filter(|&j| tokens[j] == "(") else {
+            continue;
+        };
+        if !writes(t) || text[i] != t {
+            continue;
+        }
+        let prev = (0..i).rev().find(|&j| significant(tokens[j]));
+        if prev.is_none_or(|j| matches!(tokens[j], ";" | "{" | "}" | ")" | "else")) {
+            text[i] = format!("if (hz_primary) {t}");
+            continue;
+        }
+        // The call's arguments, at its top-level commas.
+        let (mut depth, mut args, mut from, mut close) = (0, Vec::new(), open + 1, None);
+        for (j, &u) in tokens.iter().enumerate().skip(open) {
+            match u {
+                "(" | "[" => depth += 1,
+                ")" | "]" if depth == 1 && u == ")" => {
+                    args.push(tokens[from..j].concat());
+                    close = Some(j);
+                    break;
+                }
+                ")" | "]" => depth -= 1,
+                "," if depth == 1 => {
+                    args.push(tokens[from..j].concat());
+                    from = j + 1;
+                }
+                _ => {}
+            }
+        }
+        let Some(close) = close else { continue };
+        let read = if t.starts_with("imageAtomic") && args.len() >= 2 {
+            format!("imageLoad({}, {}).x", args[0], args[1])
+        } else if t.starts_with("atomic") && !args.is_empty() {
+            format!("({})", args[0])
+        } else {
+            continue;
+        };
+        text[i] = format!("(hz_primary ? {t}");
+        text[close] = format!(") : {read})");
+    }
 }
 
 /// `vec3[2]` or `vec3` → (`vec3`, `[2]`).

@@ -168,6 +168,7 @@ pub const NAMES: &[&str] = &[
     "relativeEyePosition",
     "playerLookVector",
     "playerBodyVector",
+    "firstPersonCamera",
 ];
 
 /// Values carried from frame to frame.
@@ -366,6 +367,7 @@ impl FrameUniforms {
                 "eyePosition" => v3(camera),
                 "relativeEyePosition" => v3(Vec3::ZERO),
                 "playerLookVector" | "playerBodyVector" => v3(look),
+                "firstPersonCamera" => Value::i(&[1]),
                 "eyeAltitude" => Value::f(&[frame.camera.y as f32]),
                 "upPosition" => v3(to_view(Vec3::new(0.0, 100.0, 0.0))),
                 "sunPosition" => v3(sun),

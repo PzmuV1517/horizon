@@ -421,6 +421,7 @@ pub struct PackPost {
     images: Vec<pack_images::PackImage>,
     /// Set 5 of programs with a geometry stage.
     indices: wgpu::BindGroupLayout,
+    shadow_culling: horizon_shaders::ShadowCulling,
     dump: Option<pack_images::Dump>,
     buffers: pack_images::Buffers,
     textures: Vec<pack_textures::PackTexture>,
@@ -768,6 +769,9 @@ pub(super) struct ShadowView {
     pub cull: glam::Mat4,
     pub light: glam::Vec3,
     pub distance: Option<f32>,
+    /// Draw everything, every face, within this many blocks (`shadow.culling=false|reversed`):
+    /// packs that voxelize the world in their shadow pass need all of it.
+    pub unculled: Option<f32>,
 }
 
 /// Set 3 of flat terrain, read by the vertex stage: `mc_Entity`'s table (-1 pairs when empty)
@@ -1993,6 +1997,7 @@ impl PackPost {
             },
             buffers,
             indices,
+            shadow_culling: post.shadow_culling,
             dump: pack_images::Dump::new(),
             dummy_3d: device
                 .create_texture(&wgpu::TextureDescriptor {
@@ -2807,6 +2812,11 @@ impl PackPost {
             cull: pack_uniforms::shadow_culling(frame, shadow),
             light: pack_uniforms::shadow_light(frame, shadow),
             distance: (shadow.render_mul > 0.0).then_some(shadow.distance * shadow.render_mul),
+            unculled: match self.shadow_culling {
+                horizon_shaders::ShadowCulling::On => None,
+                horizon_shaders::ShadowCulling::Off => Some(f32::INFINITY),
+                horizon_shaders::ShadowCulling::Reversed => Some(shadow.voxel_distance),
+            },
         })
     }
 

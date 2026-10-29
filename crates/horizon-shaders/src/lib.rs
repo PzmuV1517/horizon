@@ -41,7 +41,7 @@ pub use options::{switches_on, value_options, with_options};
 pub use pack::{Pack, PackError};
 pub use post::{
     Blend, BufferObject, BufferSize, CELESTIAL_BLEND, CustomImage, Factor, GameInputs, Group,
-    ImageSize, Post, PostProgram, TRANSLUCENT_BLEND, dimension_folder, load_post,
+    ImageSize, Post, PostProgram, ShadowCulling, TRANSLUCENT_BLEND, dimension_folder, load_post,
 };
 pub use preprocess::{Diagnostic, Origin, Preprocessed, preprocess};
 pub use properties::{Entry, Note, Properties};

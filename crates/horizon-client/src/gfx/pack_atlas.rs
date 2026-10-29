@@ -204,8 +204,15 @@ impl PackAtlas {
         } else {
             "vec4(-1.0, -1.0, 0.0, 0.0)"
         };
+        // The block a face belongs to: half a block behind its centre (the quad's diagonal).
+        let mid_block = if flat {
+            "vec4((floor((hz_p0 + hz_p2) * 0.5 - 0.5 * hz_Normal) + 0.5 - hz_v_pos) * 64.0, 0.0)"
+        } else {
+            "vec4(0.0)"
+        };
         let attributes = [
             ("mc_Entity", entity),
+            ("at_midBlock", mid_block),
             (
                 "mc_midTexCoord",
                 "vec4((hz_cell + 0.5) * hz_scale, 0.0, 1.0)",

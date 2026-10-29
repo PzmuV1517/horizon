@@ -346,6 +346,13 @@ impl CustomImage {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ShadowCulling {
+    On,
+    Off,
+    Reversed,
+}
+
 pub struct Post {
     /// The folder the programs came from: `""` for `shaders` itself, else `world0`...
     pub folder: String,
@@ -406,6 +413,9 @@ pub struct Post {
     pub buffer_objects: std::collections::BTreeMap<u32, BufferObject>,
     /// `image.*`.
     pub images: Vec<CustomImage>,
+    /// `shadow.culling`: `false` draws everything within the shadow distance, every face, not
+    /// only what casts a shadow into view; `reversed` within `voxelDistance` of the player.
+    pub shadow_culling: ShadowCulling,
     pub config: Config,
     /// Programs skipped and why, as `program: message` or `file:line: message`.
     pub notes: Vec<String>,
@@ -481,6 +491,11 @@ pub fn load_post(
         sizes: [None; crate::BUFFERS],
         buffer_objects: Default::default(),
         images: Vec::new(),
+        shadow_culling: match properties.get("shadow.culling").map(str::trim) {
+            Some("false") => ShadowCulling::Off,
+            Some("reversed") => ShadowCulling::Reversed,
+            _ => ShadowCulling::On,
+        },
         config: Config::default(),
         notes: Vec::new(),
     };
