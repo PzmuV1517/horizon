@@ -34,6 +34,7 @@ winit = "0.30.13"
 pollster = "0.4"
 bytemuck = { version = "1.24", features = ["derive"] }
 glam = "0.30"
+half = "2"
 png = "0.18"
 sha2 = "0.10.9"
 # Server resource packs are checked and cached by their SHA-1, as vanilla does.

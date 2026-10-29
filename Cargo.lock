@@ -1382,6 +1382,7 @@ dependencies = [
  "flate2",
  "gilrs",
  "glam",
+ "half",
  "horizon-assets",
  "horizon-bench",
  "horizon-client-core",
@@ -1643,8 +1644,10 @@ dependencies = [
 name = "horizon-shaders"
 version = "0.1.0"
 dependencies = [
+ "half",
  "horizon-core",
  "naga",
+ "png",
  "zip",
 ]
 
@@ -2219,7 +2222,7 @@ checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 [[package]]
 name = "naga"
 version = "30.0.1"
-source = "git+https://github.com/PzmuV1517/wgpu?rev=a5d9da40b2bbc35f8c6c47a7fdfc860f7092c507#a5d9da40b2bbc35f8c6c47a7fdfc860f7092c507"
+source = "git+https://github.com/PzmuV1517/wgpu?rev=f219f9547989b747c47f9d079048071c7f827f28#f219f9547989b747c47f9d079048071c7f827f28"
 dependencies = [
  "arrayvec",
  "bit-set",
@@ -2245,7 +2248,7 @@ dependencies = [
 [[package]]
 name = "naga-types"
 version = "30.0.1"
-source = "git+https://github.com/PzmuV1517/wgpu?rev=a5d9da40b2bbc35f8c6c47a7fdfc860f7092c507#a5d9da40b2bbc35f8c6c47a7fdfc860f7092c507"
+source = "git+https://github.com/PzmuV1517/wgpu?rev=f219f9547989b747c47f9d079048071c7f827f28#f219f9547989b747c47f9d079048071c7f827f28"
 dependencies = [
  "hashbrown 0.17.1",
  "indexmap",

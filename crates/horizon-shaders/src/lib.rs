@@ -10,6 +10,7 @@
 //! - [`translate_composite`], [`translate_gbuffers`], [`translate_shadow`]: a program into naga modules and its interface (1.6, 2.2).
 //! - [`Config`] and [`draw_buffers`]: the buffer settings and output lists stage files carry (1.7, 6.1).
 //! - [`load_post`]: a dimension's `prepare`, `deferred`, `composite` and `final` programs, in order (2.1).
+//! - [`load_textures`]: the custom textures `texture.*` names (3.4).
 //! - [`Macros`] and [`eval_condition`]: the macros packs test, and the `#if` arithmetic (1.5).
 
 mod biomes;
@@ -25,6 +26,7 @@ mod pack;
 mod post;
 mod preprocess;
 mod properties;
+mod textures;
 mod translate;
 
 pub use biomes::{category as biome_category, precipitation as biome_precipitation};
@@ -43,6 +45,9 @@ pub use post::{
 };
 pub use preprocess::{Diagnostic, Origin, Preprocessed, preprocess};
 pub use properties::{Entry, Note, Properties};
+pub use textures::{
+    CustomTexture, Dim as TextureDim, Texels, Texture, TextureSource, decode_png, load_textures,
+};
 pub use translate::{
     AlphaTest, DRAW_UNIFORMS, Error, GbuffersInputs, Interface, Program, Sampler, Target, Uniform,
     translate_composite, translate_gbuffers, translate_shadow,

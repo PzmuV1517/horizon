@@ -238,6 +238,13 @@ fn translate(
             samplers.insert(name.clone(), ty.clone());
         }
     }
+    // `alphaTestRef` is the program's alpha test reference: a constant of the program.
+    let alpha_test_ref = gbuffers
+        .filter(|_| uniforms.get("alphaTestRef").is_some_and(|t| t == "float"))
+        .map(|g| g.alpha_test.map_or(0.0, |t| t.reference));
+    if alpha_test_ref.is_some() {
+        uniforms.remove("alphaTestRef");
+    }
     // Per-draw values move to their own block; another type than the documented one keeps
     // the frame's block (and reads zero).
     let mut draw = false;
@@ -323,6 +330,9 @@ fn translate(
             .unwrap();
         }
         h.push_str(" };\n");
+        if let Some(reference) = alpha_test_ref {
+            writeln!(h, "const float alphaTestRef = {reference:?};").unwrap();
+        }
         if draw {
             h.push_str(
                 "layout(set = 2, binding = 0) uniform HzDraw { int renderStage; int entityId; \
@@ -433,6 +443,9 @@ fn translate(
         writeln!(fragment_main, "    {name} = hz_init_{name}();").unwrap();
     }
     fragment_main.push_str("    hz_main();\n");
+    for copy in &f.out_copies {
+        writeln!(fragment_main, "    {copy}").unwrap();
+    }
     // With `out` variables the pack tests alpha itself.
     if let Some(t) = gbuffers.and_then(|g| g.alpha_test)
         && f.outputs.contains(&0)
@@ -1138,6 +1151,51 @@ mod tests {
             Target::Buffers,
         )
         .unwrap_or_else(|e| panic!("{e:?}"));
+    }
+
+    #[test]
+    fn narrow_outputs_widen_and_inverse_is_ours() {
+        let fsh = "#version 400\nlayout(location = 0) out vec3 color;\nlayout(location = 1) out float depth;\n\
+                   uniform mat4 gbufferProjection;\nuniform mat3 m3;\n\
+                   void main() { color = (inverse(gbufferProjection) * vec4(1.0)).xyz * inverse(m3)[0]; depth = 0.5; }\n";
+        let p = program(
+            &[("composite.vsh", VSH_120), ("composite.fsh", fsh)],
+            Target::Buffers,
+        )
+        .unwrap_or_else(|e| panic!("{e:?}"));
+        let outputs: Vec<_> = p.fragment.entry_points[0]
+            .function
+            .result
+            .iter()
+            .flat_map(|r| match &p.fragment.types[r.ty].inner {
+                naga::TypeInner::Struct { members, .. } => {
+                    members.iter().map(|m| m.ty).collect::<Vec<_>>()
+                }
+                _ => vec![r.ty],
+            })
+            .map(|ty| p.fragment.types[ty].inner.clone())
+            .collect();
+        assert!(
+            outputs.iter().all(|t| matches!(
+                t,
+                naga::TypeInner::Vector {
+                    size: naga::VectorSize::Quad,
+                    ..
+                }
+            )),
+            "{outputs:?}"
+        );
+        assert!(p.fragment.functions.iter().all(|(_, f)| {
+            f.expressions.iter().all(|(_, e)| {
+                !matches!(
+                    e,
+                    naga::Expression::Math {
+                        fun: naga::MathFunction::Inverse,
+                        ..
+                    }
+                )
+            })
+        }));
     }
 
     #[test]

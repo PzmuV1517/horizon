@@ -265,6 +265,8 @@ pub struct Post {
     pub particles_late: bool,
     /// The custom uniforms of `shaders.properties` (3.4).
     pub custom: Custom,
+    /// `texture.*`: the textures the pack binds to sampler names.
+    pub textures: Vec<crate::CustomTexture>,
     pub config: Config,
     /// Programs skipped and why, as `program: message` or `file:line: message`.
     pub notes: Vec<String>,
@@ -334,9 +336,13 @@ pub fn load_post(
         translucent_late: false,
         particles_late: false,
         custom: Custom::parse(properties),
+        textures: Vec::new(),
         config: Config::default(),
         notes: Vec::new(),
     };
+    let (textures, notes) = crate::load_textures(pack, properties);
+    post.textures = textures;
+    post.notes.extend(notes);
     let mut loader = Loader {
         pack,
         folder,
@@ -455,7 +461,14 @@ pub fn load_post(
             p
         });
     if let Some(inputs) = &inputs.terrain {
-        let terrain = gbuffers(&TERRAIN, Group::Gbuffers, inputs);
+        // Solid and cutout terrain draw together: the cutout test, unless `alphaTest.*` says
+        // otherwise (3.2).
+        let mut cutout = inputs.clone();
+        cutout.alpha_test = cutout.alpha_test.or(Some(crate::AlphaTest {
+            op: ">",
+            reference: 0.1,
+        }));
+        let terrain = gbuffers(&TERRAIN, Group::Gbuffers, &cutout);
         // gbuffers_water falls back to gbuffers_terrain's chain (2.3).
         let water = gbuffers(&WATER, Group::Translucent, inputs);
         loader.post.terrain = terrain;

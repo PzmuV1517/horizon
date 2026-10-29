@@ -38,6 +38,10 @@ pub(super) struct Stage<'p> {
     pub(super) gbuffers: bool,
     /// The pack's fragment outputs, declared again with their locations.
     pub(super) frag_outs: Vec<(u32, String)>,
+    /// Narrow outputs copied into their vec4 after the pack's `main`.
+    pub(super) out_copies: Vec<String>,
+    /// The stage calls `inverse`, which ours replaces.
+    pub(super) inverse: bool,
     /// The pack's functions that take samplers: which parameters are samplers.
     pub(super) sampler_functions: HashMap<String, Vec<bool>>,
     /// The pack's structs: each member's type and name with its array suffix.
@@ -120,6 +124,23 @@ pub(super) fn significant(t: &str) -> bool {
     !t.trim().is_empty()
 }
 
+/// A fragment output narrower than four components: the vec4 of its kind, and the components
+/// that fill it (alpha 1).
+fn widened(ty: &str) -> Option<(&'static str, &'static str)> {
+    Some(match ty {
+        "float" => ("vec4", ", 0.0, 0.0, 1.0"),
+        "vec2" => ("vec4", ", 0.0, 1.0"),
+        "vec3" => ("vec4", ", 1.0"),
+        "int" => ("ivec4", ", 0, 0, 1"),
+        "ivec2" => ("ivec4", ", 0, 1"),
+        "ivec3" => ("ivec4", ", 1"),
+        "uint" => ("uvec4", ", 0u, 0u, 1u"),
+        "uvec2" => ("uvec4", ", 0u, 1u"),
+        "uvec3" => ("uvec4", ", 1u"),
+        _ => return None,
+    })
+}
+
 /// `sampler2D`, `isampler3D`, `usampler2D`, `sampler2DShadow`...
 pub(super) fn is_sampler_type(t: &str) -> bool {
     t.trim_start_matches(['i', 'u']).starts_with("sampler")
@@ -142,6 +163,8 @@ impl<'p> Stage<'p> {
             outs: Vec::new(),
             attributes: Vec::new(),
             frag_outs: Vec::new(),
+            out_copies: Vec::new(),
+            inverse: false,
             sampler_functions: HashMap::new(),
             structs: HashMap::new(),
             outputs: BTreeSet::new(),
@@ -187,6 +210,7 @@ impl<'p> Stage<'p> {
                     }
                 }
                 "gl_FragCoord" => s.frag_coord = true,
+                "inverse" => s.inverse = true,
                 "gl_TexCoord" => {
                     if let Some((n, _)) = s.index_after(i) {
                         s.builtin_varying(format!("hz_TexCoord{n}"));
@@ -395,8 +419,23 @@ impl<'p> Stage<'p> {
                 _ if fragment => {
                     let n = location.unwrap_or(self.outputs.len() as u32);
                     self.outputs.insert(n);
-                    self.frag_outs
-                        .push((n, format!("layout(location = {n}) out {ty} {name}{array};")));
+                    // wgpu wants every component of the target's format written; GL fills
+                    // what a narrower output leaves out. Ours is a vec4, theirs a private global.
+                    match widened(&ty).filter(|_| array.is_empty()) {
+                        Some((wide, fill)) => {
+                            self.frag_outs.push((
+                                n,
+                                format!(
+                                    "layout(location = {n}) out {wide} hz_out{n}; {ty} {name};"
+                                ),
+                            ));
+                            self.out_copies
+                                .push(format!("hz_out{n} = {wide}({name}{fill});"));
+                        }
+                        None => self
+                            .frag_outs
+                            .push((n, format!("layout(location = {n}) out {ty} {name}{array};"))),
+                    }
                 }
                 _ => self.outs.push(Var {
                     name,

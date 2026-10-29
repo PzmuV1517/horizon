@@ -18,6 +18,7 @@ use horizon_shaders::{Format, Group, Kind, Post, Val};
 use super::pack_draw::DrawUniforms;
 use super::pack_entities::{PROGRAMS, PackEntities};
 use super::pack_sky::PackSky;
+use super::pack_textures;
 use super::pack_uniforms::{self, FrameUniforms, PackInputs};
 
 const BUFFERS: usize = horizon_shaders::BUFFERS;
@@ -30,8 +31,15 @@ enum Source {
     /// `depthtex1`/`depthtex2`: depth without translucent terrain (a copy taken before it).
     Depth1,
     Noise,
-    /// A 1×1 stand-in for names this slice does not provide yet (custom textures...).
+    /// A 1×1 stand-in for names this slice does not provide yet.
     Dummy,
+    /// `texture.<stage>.<name>`: the pack's own texture, filtered and wrapped as its
+    /// `.mcmeta` says.
+    Custom {
+        index: usize,
+        blur: bool,
+        clamp: bool,
+    },
     /// A 1×1 depth of 1.0 behind a comparison sampler, until shadow maps exist: no shadow.
     Shadow,
     /// The block atlas (pack_atlas.rs), in gbuffers programs.
@@ -49,6 +57,8 @@ struct Binding {
     binding: u32,
     /// A filtering sampler (the texture is filterable).
     filtering: bool,
+    /// The view's dimension: 2D, or 1D and 3D for custom textures and their stand-ins.
+    dimension: wgpu::TextureViewDimension,
     /// Where this texture's sampler object is bound: the first texture of each kind binds it
     /// (`binding + 1`), the others share it (devices have as few as 16 sampler slots).
     sampler: u32,
@@ -75,6 +85,12 @@ impl SamplerKind {
             Source::Shadow | Source::ShadowDepth(_, true) => Self::Comparison,
             // Blocks look as the game draws them: nearest texels.
             Source::Atlas => Self::NearestRepeat,
+            Source::Custom { blur, clamp, .. } => match (blur && filtering, clamp) {
+                (true, true) => Self::Linear,
+                (false, true) => Self::Nearest,
+                (true, false) => Self::Repeat,
+                (false, false) => Self::NearestRepeat,
+            },
             Source::Color(_) | Source::ShadowColor(_) | Source::Dummy | Source::Lightmap => {
                 Self::Linear
             }
@@ -313,6 +329,8 @@ pub struct PackPost {
     targets: Option<Targets>,
     noise: wgpu::TextureView,
     dummy: wgpu::TextureView,
+    dummy_3d: wgpu::TextureView,
+    textures: Vec<pack_textures::PackTexture>,
     /// The stand-in shadow map and its comparison sampler; cleared on the first frame.
     shadow: (wgpu::TextureView, wgpu::Sampler),
     shadow_cleared: bool,
@@ -476,11 +494,14 @@ fn sampler(
     })
 }
 
-/// Runs `create` and returns its validation error, if any.
+/// Runs `create` and returns its validation error, if any, or the backend's (a shader the
+/// driver's compiler refuses is an internal error).
 fn checked<T>(device: &wgpu::Device, create: impl FnOnce() -> T) -> Result<T, String> {
-    let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
     let value = create();
-    match pollster::block_on(scope.pop()) {
+    let internal = pollster::block_on(internal.pop());
+    match pollster::block_on(validation.pop()).or(internal) {
         Some(e) => {
             // The details are in the error's description or its sources.
             let mut message = match &e {
@@ -554,11 +575,19 @@ fn entry(binding: u32, ty: wgpu::BindingType) -> wgpu::BindGroupLayoutEntry {
 }
 
 fn texture_entry(binding: u32, sample_type: wgpu::TextureSampleType) -> wgpu::BindGroupLayoutEntry {
+    texture_entry_of(binding, sample_type, wgpu::TextureViewDimension::D2)
+}
+
+fn texture_entry_of(
+    binding: u32,
+    sample_type: wgpu::TextureSampleType,
+    view_dimension: wgpu::TextureViewDimension,
+) -> wgpu::BindGroupLayoutEntry {
     entry(
         binding,
         wgpu::BindingType::Texture {
             sample_type,
-            view_dimension: wgpu::TextureViewDimension::D2,
+            view_dimension,
             multisampled: false,
         },
     )
@@ -702,6 +731,7 @@ fn build_pass(
     geometry: Option<&Geometry<'_>>,
     custom: &[String],
     draws: &wgpu::BindGroupLayout,
+    textures: &[pack_textures::PackTexture],
 ) -> Option<Pass> {
     let features = device.features();
     // The frame's uniforms, then the pack's custom ones.
@@ -734,70 +764,94 @@ fn build_pass(
         None => 0,
     };
     for s in &interface.samplers {
-        let mut src = source(&s.name, p.group.shadow(), shadow.is_some(), watershadow);
-        let blank = match src {
-            // The shadow pass writes the shadow map.
-            Source::ShadowDepth(..) => p.group == Group::Shadow,
-            Source::Atlas => geometry.is_none(),
-            Source::Depth => geometry.is_some(),
-            // Translucent terrain reads the copy; opaque terrain would read itself.
-            Source::Depth1 => p.group == Group::Gbuffers,
-            Source::Color(n) => in_place & 1 << n != 0,
-            _ => false,
-        };
         let float = wgpu::TextureSampleType::Float { filterable: true };
-        let mut sample_type = match src {
-            Source::Color(n) => formats[n]
-                .sample_type(None, Some(features))
-                .unwrap_or(float),
-            Source::ShadowColor(n) => shadow
-                .and_then(|f| f[n].sample_type(None, Some(features)))
-                .unwrap_or(float),
-            Source::Depth | Source::Depth1 | Source::ShadowDepth(..) => {
-                wgpu::TextureSampleType::Float { filterable: false }
+        let custom = pack_textures::find(textures, p.group, &s.ty, &s.name);
+        let (src, sample_type, dimension) = match custom {
+            Some(i) => {
+                let t = &textures[i];
+                let src = match t.image {
+                    pack_textures::Image::Lightmap => Source::Lightmap,
+                    pack_textures::Image::Atlas => Source::Atlas,
+                    pack_textures::Image::View(_) => Source::Custom {
+                        index: i,
+                        blur: t.blur,
+                        clamp: t.clamp,
+                    },
+                };
+                (src, t.sample_type, t.dimension)
             }
-            // Unfilterable on WebGPU-level devices; the lightmap is sampled at texel centres.
-            Source::Lightmap => float,
-            _ => float,
-        };
-        let int = !matches!(sample_type, wgpu::TextureSampleType::Float { .. });
-        if s.ty == "sampler2DShadow" {
-            src = match src {
-                Source::ShadowDepth(n, _) => Source::ShadowDepth(n, true),
-                _ => Source::Shadow,
-            };
-            sample_type = wgpu::TextureSampleType::Depth;
-        }
-        let wanted = match s.ty.as_str() {
-            "sampler2DShadow" => true,
-            "sampler2D" => !int,
-            "isampler2D" => sample_type == wgpu::TextureSampleType::Sint,
-            "usampler2D" => sample_type == wgpu::TextureSampleType::Uint,
-            _ => false,
-        };
-        if !wanted {
-            notes.push(format!(
-                "{}: `{} {}` is not provided yet",
-                p.name, s.ty, s.name
-            ));
-            (src, sample_type) = (Source::Dummy, float);
-        }
-        if blank && sample_type == wgpu::TextureSampleType::Depth {
-            src = Source::Shadow;
-        } else if blank {
-            // The blank texture is float: an integer sampler then fails the pipeline (a note).
-            src = Source::Dummy;
-            if int {
-                sample_type = float;
+            None => {
+                let mut src = source(&s.name, p.group.shadow(), shadow.is_some(), watershadow);
+                let blank = match src {
+                    // The shadow pass writes the shadow map.
+                    Source::ShadowDepth(..) => p.group == Group::Shadow,
+                    Source::Atlas => geometry.is_none(),
+                    Source::Depth => geometry.is_some(),
+                    // Translucent terrain reads the copy; opaque terrain would read itself.
+                    Source::Depth1 => p.group == Group::Gbuffers,
+                    Source::Color(n) => in_place & 1 << n != 0,
+                    _ => false,
+                };
+                let mut sample_type = match src {
+                    Source::Color(n) => formats[n]
+                        .sample_type(None, Some(features))
+                        .unwrap_or(float),
+                    Source::ShadowColor(n) => shadow
+                        .and_then(|f| f[n].sample_type(None, Some(features)))
+                        .unwrap_or(float),
+                    Source::Depth | Source::Depth1 | Source::ShadowDepth(..) => {
+                        wgpu::TextureSampleType::Float { filterable: false }
+                    }
+                    // Unfilterable on WebGPU-level devices; the lightmap is sampled at texel centres.
+                    Source::Lightmap => float,
+                    _ => float,
+                };
+                let int = !matches!(sample_type, wgpu::TextureSampleType::Float { .. });
+                if s.ty == "sampler2DShadow" {
+                    src = match src {
+                        Source::ShadowDepth(n, _) => Source::ShadowDepth(n, true),
+                        _ => Source::Shadow,
+                    };
+                    sample_type = wgpu::TextureSampleType::Depth;
+                }
+                let wanted = match s.ty.as_str() {
+                    "sampler2DShadow" => true,
+                    "sampler2D" => !int,
+                    "isampler2D" => sample_type == wgpu::TextureSampleType::Sint,
+                    "usampler2D" => sample_type == wgpu::TextureSampleType::Uint,
+                    _ => false,
+                };
+                if !wanted {
+                    notes.push(format!(
+                        "{}: `{} {}` is not provided yet",
+                        p.name, s.ty, s.name
+                    ));
+                    (src, sample_type) = (Source::Dummy, float);
+                }
+                if blank && sample_type == wgpu::TextureSampleType::Depth {
+                    src = Source::Shadow;
+                } else if blank {
+                    // The blank texture is float: an integer sampler then fails the pipeline (a note).
+                    src = Source::Dummy;
+                    if int {
+                        sample_type = float;
+                    }
+                }
+                // A stand-in of the sampler's own dimension.
+                let dimension = match (src, s.ty.as_str()) {
+                    (Source::Dummy, t) if t.contains("3D") => wgpu::TextureViewDimension::D3,
+                    _ => wgpu::TextureViewDimension::D2,
+                };
+                (src, sample_type, dimension)
             }
-        }
+        };
         let filtering = sample_type == float;
         match src {
             Source::Color(n) => reads |= 1 << n,
             Source::ShadowColor(n) => shadow_reads |= 1 << n,
             _ => {}
         }
-        entries.push(texture_entry(s.binding, sample_type));
+        entries.push(texture_entry_of(s.binding, sample_type, dimension));
         let kind = SamplerKind::of(src, filtering);
         let sampler = *kinds.entry(kind).or_insert_with(|| {
             entries.push(entry(
@@ -812,6 +866,7 @@ fn build_pass(
             binding: s.binding,
             filtering,
             sampler,
+            dimension,
         });
     }
     let final_pass = p.group == Group::Final;
@@ -840,6 +895,11 @@ fn build_pass(
             targets[l] = state;
             writes.push((location, buffer as usize));
         }
+    }
+    // Outputs past the last buffer the program writes go nowhere, as in GL; a pass has no
+    // attachment for them.
+    while targets.last().is_some_and(Option::is_none) {
+        targets.pop();
     }
     if !final_pass && writes.is_empty() {
         notes.push(format!("{}: writes no buffer; skipped", p.name));
@@ -983,6 +1043,7 @@ impl PackPost {
         });
         let mut notes = post.notes;
         notes.extend(post.config.notes);
+        let textures = pack_textures::upload(device, queue, post.textures, &mut notes);
         let shadow_config = post.config.shadow.clone();
         let mut custom = post.custom;
         let custom_names: Vec<String> = custom.uniforms().map(|u| u.0.to_owned()).collect();
@@ -1018,6 +1079,7 @@ impl PackPost {
                 geometry,
                 &custom_names,
                 &draws.layout,
+                &textures,
             )?;
             if !in_shadow {
                 used |= pass.reads | pass.written | pass.flip;
@@ -1445,8 +1507,27 @@ impl PackPost {
             blit_group: None,
             main: 0,
             targets: None,
-            noise: noise(device, queue),
+            noise: pack_textures::noise(&textures)
+                .cloned()
+                .unwrap_or_else(|| noise(device, queue)),
             dummy: texture(device, queue, "Shader pack stand-in", 1, &white),
+            dummy_3d: device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some("Shader pack 3D stand-in"),
+                    size: wgpu::Extent3d {
+                        width: 1,
+                        height: 1,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D3,
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                })
+                .create_view(&Default::default()),
+            textures,
             shadow: (
                 device
                     .create_texture(&wgpu::TextureDescriptor {
@@ -1587,7 +1668,14 @@ impl PackPost {
                         _ => &targets.depth,
                     },
                     Source::Noise => &self.noise,
+                    Source::Dummy if s.dimension == wgpu::TextureViewDimension::D3 => {
+                        &self.dummy_3d
+                    }
                     Source::Dummy => &self.dummy,
+                    Source::Custom { index, .. } => match &self.textures[index].image {
+                        pack_textures::Image::View(v) => v,
+                        _ => &self.dummy,
+                    },
                     Source::Shadow => &self.shadow.0,
                     Source::Atlas => pass
                         .atlas
