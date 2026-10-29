@@ -638,6 +638,7 @@ pub fn translate_compute(compute: &Preprocessed) -> Result<ComputeProgram, Vec<E
         .collect();
     let mut images = bind_images([&c, &c], samplers.len());
     let code = c.rewrite(&samplers, &uniforms);
+    let code = work_group_size(&code);
     let code = ordering::barriers_after_atomics(&code).unwrap_or(code);
     let declared: Vec<(String, bool)> = c
         .images
@@ -714,6 +715,42 @@ pub fn translate_compute(compute: &Preprocessed) -> Result<ComputeProgram, Vec<E
             })
             .unwrap_or([1.0, 1.0]),
     })
+}
+
+/// `code` with `gl_WorkGroupSize` written as the constant its `layout(local_size_*)` declares:
+/// GLSL defines it so, and naga's HLSL writer has no such built-in.
+fn work_group_size(code: &str) -> String {
+    let tokens = crate::macros::lex(code);
+    if !tokens.contains(&"gl_WorkGroupSize") {
+        return code.to_owned();
+    }
+    let sig: Vec<&str> = tokens
+        .iter()
+        .copied()
+        .filter(|t| scan::significant(t))
+        .collect();
+    let size = |axis: &str| {
+        sig.windows(3)
+            .find(|w| w[0] == axis && w[1] == "=")
+            .and_then(|w| w[2].trim_end_matches(['u', 'U']).parse::<u32>().ok())
+            .unwrap_or(1)
+    };
+    let value = format!(
+        "uvec3({}u, {}u, {}u)",
+        size("local_size_x"),
+        size("local_size_y"),
+        size("local_size_z")
+    );
+    tokens
+        .iter()
+        .map(|&t| {
+            if t == "gl_WorkGroupSize" {
+                value.as_str()
+            } else {
+                t
+            }
+        })
+        .collect()
 }
 
 /// The numbers of a constant's constructor, `const ivec3 name = ivec3(1, 2, 3);` → 1, 2, 3.
@@ -1429,6 +1466,28 @@ mod tests {
                 )
             })
         }));
+    }
+
+    #[test]
+    fn work_group_size_is_its_layout() {
+        let csh = "#version 430\nlayout(local_size_x = 8, local_size_y = 4) in;\n\
+                   layout(r32ui) uniform uimage2D colorimg4;\nvoid main() {\n    \
+                   imageStore(colorimg4, ivec2(gl_WorkGroupSize.xy), uvec4(gl_WorkGroupSize.z));\n}\n";
+        let pack = Pack::from_zip_bytes("P.zip", zip(&[("shaders/deferred_a.csh", csh)])).unwrap();
+        let c = translate_compute(&preprocess(&pack, "deferred_a.csh", &Macros::standard()))
+            .unwrap_or_else(|e| panic!("{e:?}"));
+        let main = &c
+            .module
+            .functions
+            .iter()
+            .find(|f| f.1.name.as_deref() == Some("hz_main"))
+            .unwrap()
+            .1;
+        assert!(
+            main.expressions
+                .iter()
+                .any(|(_, e)| matches!(e, naga::Expression::Literal(naga::Literal::U32(8))))
+        );
     }
 
     #[test]
