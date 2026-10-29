@@ -281,14 +281,15 @@ impl FrameUniforms {
         let dt = self.last.map_or(0.0, |l| (now - l).as_secs_f32());
         self.last = Some(now);
         let aspect = size[0] as f32 / size[1].max(1) as f32;
-        let view = crate::camera::view_matrix(frame.yaw, frame.pitch);
+        // Packs take gbufferProjection for a plain perspective (they invert only its perspective
+        // terms): the view bob and the nausea spin belong to the model-view, as GL drew them.
+        let view = frame.bob * frame.spin * crate::camera::view_matrix(frame.yaw, frame.pitch);
         let projection = Mat4::perspective_rh_gl(
             frame.fov_degrees.to_radians(),
             aspect,
             0.05,
             frame.depth_far,
-        ) * frame.bob
-            * frame.spin;
+        );
         let camera = frame.camera.as_vec3();
         let (previous_camera, previous_view, previous_projection) =
             self.previous

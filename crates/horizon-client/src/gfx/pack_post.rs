@@ -2409,7 +2409,6 @@ impl PackPost {
             frame.hand_fov_degrees,
             size[0] as f32 / size[1].max(1) as f32,
             frame.depth_far,
-            frame.bob,
         );
         geometry.prepare(device, queue, frame.hand, projection);
         if geometry.quads > 0 {
