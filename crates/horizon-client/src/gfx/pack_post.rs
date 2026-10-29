@@ -2893,6 +2893,15 @@ impl PackPost {
                 let mut attachment = wgpu::TextureUsages::RENDER_ATTACHMENT;
                 if self.storage & 1 << i != 0 {
                     attachment |= wgpu::TextureUsages::STORAGE_BINDING;
+                    // Atomics on a texture need it made for them (Metal ignores them otherwise).
+                    if device.features().contains(wgpu::Features::TEXTURE_ATOMIC)
+                        && matches!(
+                            self.formats[i],
+                            wgpu::TextureFormat::R32Sint | wgpu::TextureFormat::R32Uint
+                        )
+                    {
+                        attachment |= wgpu::TextureUsages::STORAGE_ATOMIC;
+                    }
                 }
                 if self.copied & 1 << i != 0 {
                     attachment |= wgpu::TextureUsages::COPY_SRC;
